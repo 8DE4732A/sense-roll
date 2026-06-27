@@ -6,9 +6,9 @@ import unittest
 import httpx
 from starlette.requests import Request
 
-from config import AppConfig, KeyConfig, ProxyConfig, RotationRule
-from key_manager import KeyManager
-from proxy import ProxyService
+from sense_roll.config import AppConfig, KeyConfig, ProxyConfig, RotationRule
+from sense_roll.key_manager import KeyManager
+from sense_roll.proxy import ProxyService
 
 
 def make_request(body: bytes, headers: dict[str, str] | None = None) -> Request:
@@ -189,3 +189,45 @@ class ProxyServiceTests(unittest.IsolatedAsyncioTestCase):
         # Content-length should be recalculated by Starlette to 12 (decompressed size) instead of gzip size
         self.assertEqual(response.headers.get("content-length"), "12")
         self.assertEqual(response.headers.get("x-custom-header"), "test-value")
+
+    async def test_routing_strategy_fill_first(self) -> None:
+        config = app_config()
+        config.routing.strategy = "fill-first"
+        km = KeyManager(["key-1", "key-2"], cooldown_seconds=60, strategy="fill-first")
+        self.service = ProxyService(config, km)
+        calls: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            calls.append(request.headers["authorization"])
+            return httpx.Response(200, json={"ok": True})
+
+        self.service.client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        
+        request1 = make_request(b"{}", {"content-type": "application/json"})
+        await self.service.handle_proxy_request(request1)
+
+        request2 = make_request(b"{}", {"content-type": "application/json"})
+        await self.service.handle_proxy_request(request2)
+
+        self.assertEqual(calls, ["Bearer key-1", "Bearer key-1"])
+
+    async def test_routing_strategy_round_robin(self) -> None:
+        config = app_config()
+        config.routing.strategy = "round-robin"
+        km = KeyManager(["key-1", "key-2"], cooldown_seconds=60, strategy="round-robin")
+        self.service = ProxyService(config, km)
+        calls: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            calls.append(request.headers["authorization"])
+            return httpx.Response(200, json={"ok": True})
+
+        self.service.client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        
+        request1 = make_request(b"{}", {"content-type": "application/json"})
+        await self.service.handle_proxy_request(request1)
+
+        request2 = make_request(b"{}", {"content-type": "application/json"})
+        await self.service.handle_proxy_request(request2)
+
+        self.assertEqual(set(calls), {"Bearer key-1", "Bearer key-2"})

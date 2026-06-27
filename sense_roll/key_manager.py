@@ -24,13 +24,19 @@ class KeyManager:
     Thread-safe: all public methods acquire the internal lock.
     """
 
-    def __init__(self, keys: list[str], cooldown_seconds: int = 60) -> None:
+    def __init__(
+        self,
+        keys: list[str],
+        cooldown_seconds: int = 60,
+        strategy: str = "fill-first",
+    ) -> None:
         if not keys:
             raise ValueError("At least one API key is required")
 
         self._keys = list(keys)
         self._index = 0
         self._cooldown_seconds = cooldown_seconds
+        self._strategy = strategy
         self._lock = threading.Lock()
         self._stats: dict[int, KeyStats] = {}
         for i, key in enumerate(self._keys):
@@ -60,12 +66,51 @@ class KeyManager:
         Thread-safe: does NOT mutate state.
         """
         with self._lock:
-            return self._keys[self._index]
+            if self._strategy == "fill-first":
+                now = time.time()
+                for i, key in enumerate(self._keys):
+                    if self._is_available(self._stats[i], now):
+                        return key
+                return self._keys[0]
+            else:
+                return self._keys[self._index]
 
     def get_current_key_prefix(self) -> str:
         """Return the prefix of the current key (for safe display)."""
         with self._lock:
-            return self._stats[self._index].key_prefix
+            if self._strategy == "fill-first":
+                now = time.time()
+                for i, key in enumerate(self._keys):
+                    if self._is_available(self._stats[i], now):
+                        return self._stats[i].key_prefix
+                return self._stats[0].key_prefix
+            else:
+                return self._stats[self._index].key_prefix
+
+    def get_key(self, attempted_keys: set[str] | None = None) -> str | None:
+        """Get the next key to use, based on the routing strategy and availability.
+
+        Respects cooldowns and excludes any keys in `attempted_keys`.
+        """
+        if attempted_keys is None:
+            attempted_keys = set()
+
+        with self._lock:
+            now = time.time()
+            if self._strategy == "fill-first":
+                # Fill-first: always check from the beginning of the list
+                for i, key in enumerate(self._keys):
+                    if key not in attempted_keys and self._is_available(self._stats[i], now):
+                        return key
+                return None
+            else:
+                # Round-robin: advance index and find the next available, untried key
+                for _ in range(len(self._keys)):
+                    self._advance_index()
+                    key = self._keys[self._index]
+                    if key not in attempted_keys and self._is_available(self._stats[self._index], now):
+                        return key
+                return None
 
     def rotate(self) -> str:
         """Advance to the next key (round-robin) and return it.

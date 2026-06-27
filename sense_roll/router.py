@@ -12,7 +12,7 @@ router = APIRouter()
 
 def _get_services():
     """Lazy-import to avoid circular dependency at module load time."""
-    from main import key_manager, proxy_service  # noqa: PLC0415
+    from .main import key_manager, proxy_service  # noqa: PLC0415
 
     if proxy_service is None or key_manager is None:
         raise HTTPException(status_code=503, detail="service is not initialised")

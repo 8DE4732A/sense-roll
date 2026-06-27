@@ -12,8 +12,8 @@ from fastapi import Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 from jsonpath_ng import parse as jsonpath_parse
 
-from config import AppConfig
-from key_manager import KeyManager
+from .config import AppConfig
+from .key_manager import KeyManager
 
 logger = logging.getLogger(__name__)
 
@@ -83,7 +83,6 @@ class ProxyService:
         """
         body = await request.body()
         is_stream = self._is_streaming_request(request, body)
-        key = self.key_manager.get_current_key()
         attempted_keys: set[str] = set()
         attempts = 0
         max_attempts = min(
@@ -91,19 +90,15 @@ class ProxyService:
             max(1, self.config.proxy.max_retries + 1),
         )
 
-        # Use the first key only if it is out of cooldown
-        if not self.key_manager.is_key_available(key):
-            next_key = self.key_manager.next_available_key()
-            if next_key is None:
-                return JSONResponse(
-                    status_code=503,
-                    content={
-                        "error": "all keys are cooling down",
-                        "type": "proxy_error",
-                    },
-                )
-            key = next_key
-            logger.info("Skipped current key in cooldown, switched to fallback")
+        key = self.key_manager.get_key(attempted_keys)
+        if key is None:
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error": "all keys are cooling down",
+                    "type": "proxy_error",
+                },
+            )
 
         last_body = b""
         last_status: int | None = None
@@ -126,7 +121,7 @@ class ProxyService:
                 if result is None:
                     last_body = err_body or b""
                     last_status = err_status
-                    next_key = self._next_untried_available_key(attempted_keys)
+                    next_key = self.key_manager.get_key(attempted_keys)
                     if next_key is None:
                         break  # all keys in cooldown
                     key = next_key
@@ -228,15 +223,7 @@ class ProxyService:
             return re.search(match_value, value_text) is not None
         return value_text == match_value
 
-    def _next_untried_available_key(self, attempted_keys: set[str]) -> str | None:
-        """Return an available key not already tried by this client request."""
-        for _ in range(self.key_manager.total_keys):
-            next_key = self.key_manager.next_available_key()
-            if next_key is None:
-                return None
-            if next_key not in attempted_keys:
-                return next_key
-        return None
+
 
     # ------------------------------------------------------------------
     # Non-streaming proxy

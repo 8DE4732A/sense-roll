@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from config import ConfigError, load_config
+from sense_roll.config import ConfigError, load_config
 
 
 class ConfigTests(unittest.TestCase):
@@ -70,5 +70,44 @@ rotation_rules:
   - jsonpath: $.error.message
     match_value: "["
     match_type: regex
+"""
+            )
+
+    def test_loads_routing_strategy_default_and_custom(self) -> None:
+        config = self.load_from_text(
+            """
+keys:
+  - key: sk-test
+rotation_rules:
+  - jsonpath: $.error.message
+    match_value: exhausted
+"""
+        )
+        self.assertEqual(config.routing.strategy, "fill-first")
+
+        config2 = self.load_from_text(
+            """
+routing:
+  strategy: round-robin
+keys:
+  - key: sk-test
+rotation_rules:
+  - jsonpath: $.error.message
+    match_value: exhausted
+"""
+        )
+        self.assertEqual(config2.routing.strategy, "round-robin")
+
+    def test_rejects_invalid_routing_strategy(self) -> None:
+        with self.assertRaises(ConfigError):
+            self.load_from_text(
+                """
+routing:
+  strategy: invalid-strategy
+keys:
+  - key: sk-test
+rotation_rules:
+  - jsonpath: $.error.message
+    match_value: exhausted
 """
             )

@@ -45,10 +45,18 @@ class RotationRule:
 
 
 @dataclass
+class RoutingConfig:
+    """Routing/load distribution settings."""
+
+    strategy: str = "fill-first"
+
+
+@dataclass
 class AppConfig:
     """Top-level application configuration."""
 
     proxy: ProxyConfig = field(default_factory=ProxyConfig)
+    routing: RoutingConfig = field(default_factory=RoutingConfig)
     keys: list[KeyConfig] = field(default_factory=list)
     rotation_rules: list[RotationRule] = field(default_factory=list)
 
@@ -100,6 +108,17 @@ def load_config(path: str | Path = "config.yaml") -> AppConfig:
         raise ConfigError(
             "'proxy.key_cooldown_seconds' must be greater than or equal to 0"
         )
+
+    # --- routing section ---
+    routing_cfg = RoutingConfig()
+    routing_raw = raw.get("routing", {})
+    if not isinstance(routing_raw, dict):
+        raise ConfigError("'routing' must be a mapping")
+    if "strategy" in routing_raw:
+        strat = str(routing_raw["strategy"]).strip().lower()
+        if strat not in {"fill-first", "round-robin"}:
+            raise ConfigError("'routing.strategy' must be 'fill-first' or 'round-robin'")
+        routing_cfg.strategy = strat
 
     # --- keys section ---
     keys_raw = raw.get("keys", [])
@@ -154,4 +173,4 @@ def load_config(path: str | Path = "config.yaml") -> AppConfig:
             )
         )
 
-    return AppConfig(proxy=proxy_cfg, keys=keys, rotation_rules=rules)
+    return AppConfig(proxy=proxy_cfg, routing=routing_cfg, keys=keys, rotation_rules=rules)
