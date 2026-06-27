@@ -239,7 +239,14 @@ class ProxyService:
         abort = False
 
         async def _stream_or_abort() -> AsyncGenerator[bytes, None]:
+            """State-machine generator that reads from ``aiter_bytes`` exactly once.
+
+            COLLECTING: buffer chunks until ``\\n\\n`` is found, then check error.
+            FORWARDING: once the first event is clean, stream remaining chunks.
+            """
             nonlocal first_event_done, abort
+
+            forwarding = False
 
             async with self.client.stream(
                 "POST",
@@ -248,23 +255,23 @@ class ProxyService:
                 content=body,
             ) as upstream_resp:
                 async for chunk in upstream_resp.aiter_bytes():
+                    if forwarding:
+                        yield chunk
+                        continue
+
                     buffer.extend(chunk)
 
                     if not first_event_done and b"\n\n" in buffer:
                         first_event_done = True
                         if self._check_sse_error(bytes(buffer)):
                             abort = True
-                            return  # discard – upstream error
-
-                    if first_event_done:
-                        # Forward buffered data then stream the rest
+                            return  # upstream error – discard everything
+                        # First event is clean – yield buffered data and switch.
+                        forwarding = True
                         yield bytes(buffer)
                         buffer.clear()
-                        async for remaining in upstream_resp.aiter_bytes():
-                            yield remaining
-                        return
 
-                # Stream ended before a complete event – forward what we have
+                # Stream ended before the first event completed.
                 if not abort and buffer:
                     yield bytes(buffer)
 
