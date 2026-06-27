@@ -49,7 +49,10 @@ async def lifespan(app: FastAPI):
         config.proxy.max_retries,
     )
 
-    key_manager = KeyManager([k.key for k in config.keys])
+    key_manager = KeyManager(
+        [k.key for k in config.keys],
+        cooldown_seconds=config.proxy.key_cooldown_seconds,
+    )
     proxy_service = ProxyService(config, key_manager)
 
     yield

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from collections.abc import AsyncGenerator
 
 import httpx
@@ -34,6 +35,14 @@ def _filter_headers(headers: dict[str, str]) -> dict[str, str]:
     return {k: v for k, v in headers.items() if k.lower() not in HOP_BY_HOP_HEADERS}
 
 
+RESPONSE_HEADERS_TO_IGNORE = HOP_BY_HOP_HEADERS | {"content-encoding", "content-length"}
+
+
+def _filter_response_headers(headers: dict[str, str]) -> dict[str, str]:
+    """Remove hop-by-hop and content-length/encoding headers from upstream response."""
+    return {k: v for k, v in headers.items() if k.lower() not in RESPONSE_HEADERS_TO_IGNORE}
+
+
 class ProxyService:
     """FastAPI proxy service that forwards /v1/chat/completions with key rotation.
 
@@ -56,7 +65,7 @@ class ProxyService:
                 raise ValueError(
                     f"Invalid jsonpath expression '{rule.jsonpath}': {e}"
                 ) from e
-            self._rules.append((expr, rule.match_value, rule.action))
+            self._rules.append((expr, rule.match_value, rule.match_type, rule.action))
 
     async def aclose(self) -> None:
         """Close the underlying httpx client."""
@@ -72,30 +81,58 @@ class ProxyService:
         Orchestrates retries with key rotation when configured error
         patterns are detected in the upstream response.
         """
-        is_stream = self._is_streaming_request(request)
         body = await request.body()
+        is_stream = self._is_streaming_request(request, body)
         key = self.key_manager.get_current_key()
+        attempted_keys: set[str] = set()
+        attempts = 0
+        max_attempts = min(
+            self.key_manager.total_keys,
+            max(1, self.config.proxy.max_retries + 1),
+        )
 
-        last_response: httpx.Response | None = None
+        # Use the first key only if it is out of cooldown
+        if not self.key_manager.is_key_available(key):
+            next_key = self.key_manager.next_available_key()
+            if next_key is None:
+                return JSONResponse(
+                    status_code=503,
+                    content={
+                        "error": "all keys are cooling down",
+                        "type": "proxy_error",
+                    },
+                )
+            key = next_key
+            logger.info("Skipped current key in cooldown, switched to fallback")
+
         last_body = b""
+        last_status: int | None = None
 
-        for attempt in range(self.config.proxy.max_retries + 1):
+        while attempts < max_attempts:
+            attempted_keys.add(key)
+            attempts += 1
             headers = self._build_headers(request, key)
 
             try:
                 if is_stream:
-                    result = await self._proxy_streaming(headers, body, key)
-                    if result is None:
-                        # Error detected → key was rotated; retry
-                        key = self.key_manager.get_current_key()
-                        continue
-                    return result
+                    result, err_body, err_status = await self._proxy_streaming(
+                        headers, body, key
+                    )
                 else:
-                    result = await self._proxy_non_streaming(headers, body, key)
-                    if result is None:
-                        key = self.key_manager.get_current_key()
-                        continue
-                    return result
+                    result, err_body, err_status = await self._proxy_non_streaming(
+                        headers, body, key
+                    )
+
+                if result is None:
+                    last_body = err_body or b""
+                    last_status = err_status
+                    next_key = self._next_untried_available_key(attempted_keys)
+                    if next_key is None:
+                        break  # all keys in cooldown
+                    key = next_key
+                    continue
+
+                return result
 
             except httpx.TimeoutException:
                 logger.warning("Upstream timed out (key=%s)", key[:8])
@@ -121,7 +158,7 @@ class ProxyService:
         if last_body:
             return Response(
                 content=last_body,
-                status_code=last_response.status_code if last_response else 502,
+                status_code=last_status or 502,
                 media_type="application/json",
             )
         return JSONResponse(
@@ -134,15 +171,21 @@ class ProxyService:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _is_streaming_request(request: Request) -> bool:
+    def _is_streaming_request(request: Request, body: bytes = b"") -> bool:
         """Determine whether the client expects a streaming response."""
-        accept = request.headers.get("accept", "")
+        accept = request.headers.get("accept", "").lower()
         if "text/event-stream" in accept:
             return True
         # Also check content-type if the client sends it
-        content_type = request.headers.get("content-type", "")
+        content_type = request.headers.get("content-type", "").lower()
         if "text/event-stream" in content_type:
             return True
+        if "application/json" in content_type and body:
+            try:
+                payload = json.loads(body)
+            except json.JSONDecodeError:
+                return False
+            return payload.get("stream") is True
         return False
 
     @staticmethod
@@ -169,11 +212,31 @@ class ProxyService:
         except json.JSONDecodeError:
             return False
 
-        for expr, match_value, _action in self._rules:
+        for expr, match_value, match_type, _action in self._rules:
             for match in expr.find(data):
-                if match.value == match_value:
+                if self._value_matches(match.value, match_value, match_type):
                     return True
         return False
+
+    @staticmethod
+    def _value_matches(value: object, match_value: str, match_type: str) -> bool:
+        """Match a JSONPath value using the configured rule mode."""
+        value_text = str(value)
+        if match_type == "contains":
+            return match_value in value_text
+        if match_type == "regex":
+            return re.search(match_value, value_text) is not None
+        return value_text == match_value
+
+    def _next_untried_available_key(self, attempted_keys: set[str]) -> str | None:
+        """Return an available key not already tried by this client request."""
+        for _ in range(self.key_manager.total_keys):
+            next_key = self.key_manager.next_available_key()
+            if next_key is None:
+                return None
+            if next_key not in attempted_keys:
+                return next_key
+        return None
 
     # ------------------------------------------------------------------
     # Non-streaming proxy
@@ -184,10 +247,11 @@ class ProxyService:
         headers: dict[str, str],
         body: bytes,
         key: str,
-    ) -> Response | None:
+    ) -> tuple[Response | None, bytes | None, int | None]:
         """POST to upstream and check the full response for rotation triggers.
 
-        Returns a ``Response`` on success, or ``None`` when a rotation rule
+        Returns ``(Response, None, None)`` on success, or
+        ``(None, error_body_bytes, status_code)`` when a rotation rule
         matched (caller should retry with the next key).
         """
         upstream_resp = await self.client.post(
@@ -197,22 +261,25 @@ class ProxyService:
         )
         resp_body = await upstream_resp.aread()
 
-        self.key_manager.record_usage(key, is_error=False)
+        should_rotate = self._match_rotation_rules(resp_body)
+        self.key_manager.record_usage(key, is_error=should_rotate)
 
-        if self._match_rotation_rules(resp_body):
+        if should_rotate:
             logger.info(
                 "Rotation triggered by error (key=%s → next)", key[:8]
             )
-            self.key_manager.record_usage(key, is_error=True)
-            self.key_manager.rotate()
-            return None
+            return None, resp_body, upstream_resp.status_code
 
-        resp_headers = _filter_headers(dict(upstream_resp.headers))
-        return Response(
-            content=resp_body,
-            status_code=upstream_resp.status_code,
-            headers=resp_headers,
-            media_type=upstream_resp.headers.get("content-type"),
+        resp_headers = _filter_response_headers(dict(upstream_resp.headers))
+        return (
+            Response(
+                content=resp_body,
+                status_code=upstream_resp.status_code,
+                headers=resp_headers,
+                media_type=upstream_resp.headers.get("content-type"),
+            ),
+            None,
+            None,
         )
 
     # ------------------------------------------------------------------
@@ -224,85 +291,89 @@ class ProxyService:
         headers: dict[str, str],
         body: bytes,
         key: str,
-    ) -> Response | None:
+    ) -> tuple[Response | None, bytes | None, int | None]:
         """Proxy a streaming (SSE) request with error detection.
 
         Buffers the first SSE event (delimited by ``\\n\\n``).
-        If an error is found the upstream connection is discarded and
-        ``None`` is returned so the caller retries with the next key.
+        If an error is found ``(None, None, None)`` is returned so the caller
+        retries with the next key (status/body are not meaningful for SSE).
 
-        If no error is found the buffered data plus the remaining stream
-        is forwarded as a ``StreamingResponse``.
+        If no error is found ``(StreamingResponse, None, None)`` is returned.
         """
+        request = self.client.build_request(
+            "POST",
+            self.config.proxy.target_url,
+            headers=headers,
+            content=body,
+        )
+        upstream_resp = await self.client.send(request, stream=True)
+        resp_headers = _filter_response_headers(dict(upstream_resp.headers))
+        media_type = upstream_resp.headers.get("content-type", "text/event-stream")
+
+        if "text/event-stream" not in media_type.lower():
+            resp_body = await upstream_resp.aread()
+            await upstream_resp.aclose()
+            should_rotate = self._match_rotation_rules(resp_body)
+            self.key_manager.record_usage(key, is_error=should_rotate)
+            if should_rotate:
+                logger.info(
+                    "Streaming request received JSON rotation error (key=%s -> next)",
+                    key[:8],
+                )
+                return None, resp_body, upstream_resp.status_code
+            return (
+                Response(
+                    content=resp_body,
+                    status_code=upstream_resp.status_code,
+                    headers=resp_headers,
+                    media_type=media_type,
+                ),
+                None,
+                None,
+            )
+
         buffer = bytearray()
-        first_event_done = False
-        abort = False
+        upstream_iter = upstream_resp.aiter_bytes()
+        while True:
+            try:
+                chunk = await upstream_iter.__anext__()
+            except StopAsyncIteration:
+                break
+            buffer.extend(chunk)
+            if b"\n\n" in buffer or b"\r\n\r\n" in buffer:
+                break
 
-        async def _stream_or_abort() -> AsyncGenerator[bytes, None]:
-            """State-machine generator that reads from ``aiter_bytes`` exactly once.
+        first_chunk = bytes(buffer)
 
-            COLLECTING: buffer chunks until ``\\n\\n`` is found, then check error.
-            FORWARDING: once the first event is clean, stream remaining chunks.
-            """
-            nonlocal first_event_done, abort
-
-            forwarding = False
-
-            async with self.client.stream(
-                "POST",
-                self.config.proxy.target_url,
-                headers=headers,
-                content=body,
-            ) as upstream_resp:
-                async for chunk in upstream_resp.aiter_bytes():
-                    if forwarding:
-                        yield chunk
-                        continue
-
-                    buffer.extend(chunk)
-
-                    if not first_event_done and b"\n\n" in buffer:
-                        first_event_done = True
-                        if self._check_sse_error(bytes(buffer)):
-                            abort = True
-                            return  # upstream error – discard everything
-                        # First event is clean – yield buffered data and switch.
-                        forwarding = True
-                        yield bytes(buffer)
-                        buffer.clear()
-
-                # Stream ended before the first event completed.
-                if not abort and buffer:
-                    yield bytes(buffer)
-
-        gen = _stream_or_abort()
-        first_chunk: bytes | None = None
-
-        try:
-            first_chunk = await gen.__anext__()
-        except StopAsyncIteration:
-            pass
-
-        if abort or first_chunk is None:
-            # Error detected in the first SSE event
+        if first_chunk and self._check_sse_error(first_chunk):
             logger.info(
                 "Streaming rotation triggered by error event (key=%s → next)",
                 key[:8],
             )
             self.key_manager.record_usage(key, is_error=True)
-            self.key_manager.rotate()
-            return None
+            await upstream_resp.aclose()
+            return None, first_chunk, upstream_resp.status_code
 
         self.key_manager.record_usage(key, is_error=False)
 
         async def _forward() -> AsyncGenerator[bytes, None]:
-            yield first_chunk  # type: ignore[union-attr]
-            async for chunk in gen:
-                yield chunk
+            try:
+                if first_chunk:
+                    yield first_chunk
+                async for chunk in upstream_iter:
+                    yield chunk
+            finally:
+                await upstream_resp.aclose()
 
-        return StreamingResponse(
-            content=_forward(),
-            media_type="text/event-stream",
+        return (
+            StreamingResponse(
+                content=_forward(),
+                status_code=upstream_resp.status_code,
+                headers=resp_headers,
+                media_type=media_type,
+            ),
+            None,
+            None,
         )
 
     # ------------------------------------------------------------------
@@ -314,16 +385,16 @@ class ProxyService:
         text = sse_data.decode("utf-8", errors="replace")
         for line in text.split("\n"):
             line = line.strip()
-            if line.startswith("data: "):
-                json_str = line[6:].strip()
+            if line.startswith("data:"):
+                json_str = line[5:].strip()
                 if json_str == "[DONE]":
                     continue
                 try:
                     parsed = json.loads(json_str)
                 except json.JSONDecodeError:
                     continue
-                for expr, match_value, _action in self._rules:
+                for expr, match_value, match_type, _action in self._rules:
                     for m in expr.find(parsed):
-                        if m.value == match_value:
+                        if self._value_matches(m.value, match_value, match_type):
                             return True
         return False
