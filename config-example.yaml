@@ -1,0 +1,23 @@
+proxy:
+  # 上游目标地址
+  target_url: "https://token.sensenova.cn/v1/chat/completions"
+  # 单次请求最大重试次数（密钥用完后仍失败则返回最后一次错误）
+  max_retries: 3
+
+keys:
+  - key: "sk-xxxx-1"
+  - key: "sk-xxxx-2"
+  - key: "sk-xxxx-3"
+
+rotation_rules:
+  # 当上游返回 {"type":"error","error":{"type":"quota_exceeded_error","message":"..."}}
+  - description: "quota_exceeded_error"
+    jsonpath: "$.error.type"
+    match_value: "quota_exceeded_error"
+    action: "rotate"
+
+  # 当上游返回 {"type":"error","error":{"type":"...","message":"rpm exhausted"}}
+  - description: "rpm_exhausted"
+    jsonpath: "$.error.message"
+    match_value: "rpm exhausted"
+    action: "rotate"
