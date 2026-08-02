@@ -22,13 +22,10 @@ jobs:
         with:
           node-version: '22'
 
-      - name: Install npm 11
-        run: npm install -g npm@11
-
       - name: Build frontend
         working-directory: web
         run: |
-          npm ci
+          npm install
           npm run build
         # Outputs to sense_roll/web/dist/ (see vite.config.ts outDir)
 
