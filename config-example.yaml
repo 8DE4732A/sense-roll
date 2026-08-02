@@ -1,31 +1,102 @@
-proxy:
-  # 上游目标地址
-  target_url: "https://token.sensenova.cn/v1/chat/completions"
-  # 单次请求最大重试次数；实际尝试次数不会超过可用密钥数
-  max_retries: 3
-  # 密钥失败后的冷却时间（秒），冷却期内自动跳过该密钥
-  key_cooldown_seconds: 60
+providers:
+  # -----------------------------------------------------------------------
+  # SenseNova：同一组 key 同时支持 OpenAI 和 Anthropic 两种格式
+  # -----------------------------------------------------------------------
+  - name: sensenova
+    api:
+      - api_format: openai          # → POST {base_url}/chat/completions
+        base_url: "https://token.sensenova.cn/v1"
+      - api_format: anthropic       # → POST {base_url}/messages
+        base_url: "https://token.sensenova.cn/v1"
+    max_retries: 3
+    key_strategy: "fill-first"      # fill-first | round-robin
+    keys:
+      - key: "sk-sn-xxxx-1"
+      - key: "sk-sn-xxxx-2"
+    health_check_rules:
+      # deepseek-v4-flash 的 5 小时额度限制（per key per model）
+      - description: "quota_exceeded_flash"
+        jsonpath: "$.error.type"
+        match_value: "quota_exceeded_error"
+        match_type: "equals"        # equals | contains | regex
+        action: "rotate"
+        cooldown_seconds: 18000     # 5 小时
+        models: ["deepseek-v4-flash"]  # 空列表 = 适用所有模型
+      # RPM 限速（适用所有模型，冷却 60 秒）
+      - description: "rpm_exhausted"
+        jsonpath: "$.error.message"
+        match_value: "rpm exhausted"
+        match_type: "contains"
+        action: "rotate"
+        cooldown_seconds: 60
+        models: []
 
-routing:
-  # 路由策略：fill-first（默认，始终优先使用第一个可用密钥）, round-robin（轮询分摊，可增加并发处理能力）
-  strategy: "fill-first"
+  # -----------------------------------------------------------------------
+  # DeepSeek 官网：支持 OpenAI Chat Completions + Responses API
+  # -----------------------------------------------------------------------
+  - name: deepseek
+    api:
+      - api_format: openai          # → POST {base_url}/chat/completions
+        base_url: "https://api.deepseek.com/v1"
+      - api_format: openai-responses  # → POST {base_url}/responses
+        base_url: "https://api.deepseek.com/v1"
+    max_retries: 3
+    key_strategy: "round-robin"
+    keys:
+      - key: "sk-ds-xxxx-1"
+    health_check_rules:
+      - description: "rate_limit"
+        jsonpath: "$.error.type"
+        match_value: "rate_limit_exceeded"
+        match_type: "equals"
+        action: "rotate"
+        cooldown_seconds: 60
+        models: []
 
-keys:
-  - key: "sk-xxxx-1"
-  - key: "sk-xxxx-2"
-  - key: "sk-xxxx-3"
+combos:
+  # -----------------------------------------------------------------------
+  # OpenAI Chat Completions 格式 combo
+  # 客户端传 model="fast" 即可；代理自动路由并改写真实 model 字段
+  # -----------------------------------------------------------------------
+  - name: "fast"
+    api_format: openai              # 单个字符串或列表均可
+    strategy: "fill-first"         # fill-first 优先第一个 member，耗尽才切换
+    members:
+      - provider: sensenova
+        model: "deepseek-v4-flash"
+      - provider: deepseek          # sensenova 耗尽后的备用
+        model: "deepseek-chat"
 
-rotation_rules:
-  # 当上游返回 {"type":"error","error":{"type":"quota_exceeded_error","message":"..."}}
-  - description: "quota_exceeded_error"
-    jsonpath: "$.error.type"
-    match_value: "quota_exceeded_error"
-    match_type: "equals"
-    action: "rotate"
+  # -----------------------------------------------------------------------
+  # Anthropic Messages 格式 combo
+  # 客户端发到 POST /v1/messages，model="fast-ant"
+  # -----------------------------------------------------------------------
+  - name: "fast-ant"
+    api_format: anthropic
+    strategy: "fill-first"
+    members:
+      - provider: sensenova
+        model: "deepseek-v4-flash"
 
-  # 当上游返回 {"type":"error","error":{"type":"...","message":"rpm exhausted"}}
-  - description: "rpm_exhausted"
-    jsonpath: "$.error.message"
-    match_value: "rpm exhausted"
-    match_type: "contains"
-    action: "rotate"
+  # -----------------------------------------------------------------------
+  # OpenAI Responses API 格式 combo
+  # 客户端发到 POST /v1/responses，model="fast-resp"
+  # -----------------------------------------------------------------------
+  - name: "fast-resp"
+    api_format: openai-responses
+    strategy: "fill-first"
+    members:
+      - provider: deepseek
+        model: "deepseek-chat"
+
+  # -----------------------------------------------------------------------
+  # 多格式 combo：同一个 combo 名同时服务 openai 和 anthropic 请求
+  # -----------------------------------------------------------------------
+  - name: "smart"
+    api_format:
+      - openai
+      - anthropic
+    strategy: "fill-first"
+    members:
+      - provider: sensenova
+        model: "deepseek-v4-0324"

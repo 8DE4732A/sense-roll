@@ -1,23 +1,25 @@
-"""Core proxy logic with key rotation and retry for sense-roll."""
+"""Core proxy logic with two-level retry: combo member selection + key rotation."""
 
 from __future__ import annotations
 
 import json
 import logging
 import re
+import time
 from collections.abc import AsyncGenerator
+from time import perf_counter
 
 import httpx
 from fastapi import Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 from jsonpath_ng import parse as jsonpath_parse
 
-from .config import AppConfig
-from .key_manager import KeyManager
+from .combo_router import ComboRouter
+from .config import AppConfig, HealthCheckRule, ProviderConfig
+from .key_manager import ProviderKeyManager
 
 logger = logging.getLogger(__name__)
 
-# Headers that MUST NOT be forwarded (RFC 9113 and common practice)
 HOP_BY_HOP_HEADERS = frozenset({
     "connection",
     "keep-alive",
@@ -29,149 +31,290 @@ HOP_BY_HOP_HEADERS = frozenset({
     "proxy-authenticate",
 })
 
-
-def _filter_headers(headers: dict[str, str]) -> dict[str, str]:
-    """Remove hop-by-hop headers before forwarding."""
-    return {k: v for k, v in headers.items() if k.lower() not in HOP_BY_HOP_HEADERS}
-
-
 RESPONSE_HEADERS_TO_IGNORE = HOP_BY_HOP_HEADERS | {"content-encoding", "content-length"}
 
 
+def _filter_headers(headers: dict[str, str]) -> dict[str, str]:
+    return {k: v for k, v in headers.items() if k.lower() not in HOP_BY_HOP_HEADERS}
+
+
 def _filter_response_headers(headers: dict[str, str]) -> dict[str, str]:
-    """Remove hop-by-hop and content-length/encoding headers from upstream response."""
     return {k: v for k, v in headers.items() if k.lower() not in RESPONSE_HEADERS_TO_IGNORE}
 
 
 class ProxyService:
-    """FastAPI proxy service that forwards /v1/chat/completions with key rotation.
+    """Proxy service with two-level retry: combo member selection and key rotation.
 
     Handles both streaming (SSE) and non-streaming requests.
-    Detects specified error patterns in upstream responses and
-    automatically rotates to the next API key on retry.
+    API format (openai/anthropic) is determined by the request path.
     """
 
-    def __init__(self, config: AppConfig, key_manager: KeyManager) -> None:
+    def __init__(
+        self,
+        config: AppConfig,
+        provider_key_managers: dict[str, ProviderKeyManager],
+        combo_router: ComboRouter,
+        client: httpx.AsyncClient | None = None,
+        recorder=None,  # db.Recorder | None — avoids circular import
+    ) -> None:
         self.config = config
-        self.key_manager = key_manager
-        self.client = httpx.AsyncClient(timeout=httpx.Timeout(120.0))
+        self.provider_key_managers = provider_key_managers
+        self.combo_router = combo_router
+        # When a shared client is supplied (hot-reload path) we don't own it
+        # and must not close it in aclose().
+        self._owns_client = client is None
+        self.client = client if client is not None else httpx.AsyncClient(timeout=httpx.Timeout(120.0))
+        self._recorder = recorder
 
-        # Pre-compile jsonpath rules for performance
-        self._rules: list[tuple] = []
-        for rule in config.rotation_rules:
-            try:
-                expr = jsonpath_parse(rule.jsonpath)
-            except Exception as e:
-                raise ValueError(
-                    f"Invalid jsonpath expression '{rule.jsonpath}': {e}"
-                ) from e
-            self._rules.append((expr, rule.match_value, rule.match_type, rule.action))
+        self._providers: dict[str, ProviderConfig] = {p.name: p for p in config.providers}
+
+        # Pre-compile jsonpath expressions per provider
+        self._provider_rules: dict[str, list[tuple]] = {}
+        for provider in config.providers:
+            compiled = []
+            for rule in provider.health_check_rules:
+                try:
+                    expr = jsonpath_parse(rule.jsonpath)
+                except Exception as e:
+                    raise ValueError(
+                        f"Invalid jsonpath '{rule.jsonpath}' in provider {provider.name!r}: {e}"
+                    ) from e
+                compiled.append((expr, rule))
+            self._provider_rules[provider.name] = compiled
 
     async def aclose(self) -> None:
-        """Close the underlying httpx client."""
-        await self.client.aclose()
+        if self._owns_client:
+            await self.client.aclose()
 
     # ------------------------------------------------------------------
-    # Public entry point
+    # Public entry points
     # ------------------------------------------------------------------
 
-    async def handle_proxy_request(self, request: Request) -> Response:
-        """Main entry point for the ``/v1/chat/completions`` proxy.
+    async def handle_openai_request(self, request: Request) -> Response:
+        """Handle POST /v1/chat/completions (OpenAI format)."""
+        return await self._handle_request(request, api_format="openai")
 
-        Orchestrates retries with key rotation when configured error
-        patterns are detected in the upstream response.
-        """
+    async def handle_anthropic_request(self, request: Request) -> Response:
+        """Handle POST /v1/messages (Anthropic format)."""
+        return await self._handle_request(request, api_format="anthropic")
+
+    async def handle_openai_responses_request(self, request: Request) -> Response:
+        """Handle POST /v1/responses (OpenAI Responses API format)."""
+        return await self._handle_request(request, api_format="openai-responses")
+
+    async def handle_openai_images_request(self, request: Request) -> Response:
+        """Handle POST /v1/images/generations (OpenAI Images format)."""
+        return await self._handle_request(request, api_format="openai-images", force_non_stream=True)
+
+    # ------------------------------------------------------------------
+    # Core two-level retry loop
+    # ------------------------------------------------------------------
+
+    async def _handle_request(self, request: Request, api_format: str, *, force_non_stream: bool = False) -> Response:
+        t0 = perf_counter()
         body = await request.body()
-        is_stream = self._is_streaming_request(request, body)
-        attempted_keys: set[str] = set()
-        attempts = 0
-        max_attempts = min(
-            self.key_manager.total_keys,
-            max(1, self.config.proxy.max_retries + 1),
-        )
+        is_stream = False if force_non_stream else self._is_streaming_request(request, body)
+        requested_model = self._extract_model(body)
 
-        key = self.key_manager.get_key(attempted_keys)
-        if key is None:
+        combo = self.combo_router.get_combo(requested_model)
+        if combo is None:
             return JSONResponse(
-                status_code=503,
+                status_code=400,
+                content={"error": f"unknown combo: {requested_model!r}", "type": "proxy_error"},
+            )
+        if api_format not in combo.api_formats:
+            return JSONResponse(
+                status_code=400,
                 content={
-                    "error": "all keys are cooling down",
+                    "error": (
+                        f"combo {requested_model!r} supports formats {combo.api_formats!r}, "
+                        f"but request was sent to {api_format!r} endpoint"
+                    ),
                     "type": "proxy_error",
                 },
             )
 
-        last_body = b""
-        last_status: int | None = None
+        attempted_members: set[tuple[str, str]] = set()
 
-        while attempts < max_attempts:
-            attempted_keys.add(key)
-            attempts += 1
-            headers = self._build_headers(request, key)
-
-            try:
-                if is_stream:
-                    result, err_body, err_status = await self._proxy_streaming(
-                        headers, body, key
-                    )
-                else:
-                    result, err_body, err_status = await self._proxy_non_streaming(
-                        headers, body, key
-                    )
-
-                if result is None:
-                    last_body = err_body or b""
-                    last_status = err_status
-                    next_key = self.key_manager.get_key(attempted_keys)
-                    if next_key is None:
-                        break  # all keys in cooldown
-                    key = next_key
-                    continue
-
-                return result
-
-            except httpx.TimeoutException:
-                logger.warning("Upstream timed out (key=%s)", key[:8])
+        while True:
+            pair = self.combo_router.next_member(requested_model, attempted_members)
+            if pair is None:
                 return JSONResponse(
-                    status_code=504,
-                    content={"error": "upstream timeout", "type": "proxy_error"},
-                )
-            except httpx.ConnectError:
-                logger.error("Upstream connection failed (key=%s)", key[:8])
-                return JSONResponse(
-                    status_code=502,
+                    status_code=503,
                     content={
-                        "error": "upstream connection failed",
+                        "error": f"all providers exhausted for combo {requested_model!r}",
                         "type": "proxy_error",
                     },
                 )
 
-        # All retries exhausted — return the last error response
-        logger.warning(
-            "All %d keys exhausted, returning last error",
-            self.key_manager.total_keys,
-        )
-        if last_body:
-            return Response(
-                content=last_body,
-                status_code=last_status or 502,
-                media_type="application/json",
+            provider_name, model = pair
+            km = self.provider_key_managers[provider_name]
+            provider_cfg = self._providers[provider_name]
+            target_url = provider_cfg.get_chat_url(api_format)
+            actual_body = self._rewrite_model(body, model)
+            attempted_keys: set[str] = set()
+            max_attempts = provider_cfg.max_retries + 1
+
+            for _ in range(max_attempts):
+                key = km.get_key(model, attempted_keys)
+                if key is None:
+                    break
+
+                attempted_keys.add(key)
+                headers = self._build_headers(request, key)
+
+                try:
+                    if is_stream:
+                        result, matched_rule = await self._proxy_streaming(
+                            target_url, headers, actual_body, provider_name, model,
+                            combo=requested_model, key=key, t0=t0, api_format=api_format,
+                        )
+                    else:
+                        result, matched_rule = await self._proxy_non_streaming(
+                            target_url, headers, actual_body, provider_name, model,
+                        )
+
+                    if matched_rule is not None:
+                        km.record_error(key, model, matched_rule.cooldown_seconds)
+                        logger.info(
+                            "Rotation: provider=%s key=%s model=%s rule=%r cooldown=%ds",
+                            provider_name, key[:8], model,
+                            matched_rule.description, matched_rule.cooldown_seconds,
+                        )
+                        self._record(
+                            combo=requested_model, provider=provider_name, model=model,
+                            key_prefix=key[:8], api_format=api_format, is_stream=is_stream,
+                            status_code=None, success=False,
+                            matched_rule=matched_rule.description,
+                            usage={}, t0=t0,
+                        )
+                        continue
+
+                    # Non-streaming: record here (streaming records in _forward finally)
+                    if not is_stream and result is not None:
+                        raw_body = bytes(result.body) if hasattr(result, "body") else b""
+                        http_ok = result.status_code < 400
+                        usage = _extract_usage(raw_body, api_format) if http_ok else {}
+                        if http_ok:
+                            km.record_success(key, model)
+                        err_text: str | None = None
+                        if not http_ok:
+                            try:
+                                err_text = json.loads(raw_body).get("error", {})
+                                if isinstance(err_text, dict):
+                                    err_text = err_text.get("message") or str(err_text)
+                                err_text = str(err_text)
+                            except Exception:
+                                err_text = raw_body.decode(errors="replace")[:200]
+                        self._record(
+                            combo=requested_model, provider=provider_name, model=model,
+                            key_prefix=key[:8], api_format=api_format, is_stream=False,
+                            status_code=result.status_code, success=http_ok,
+                            matched_rule=None, usage=usage, t0=t0,
+                            error=err_text,
+                        )
+                    else:
+                        km.record_success(key, model)
+                    return result  # type: ignore[return-value]
+
+                except httpx.TimeoutException:
+                    logger.warning("Upstream timeout: provider=%s key=%s", provider_name, key[:8])
+                    self._record(
+                        combo=requested_model, provider=provider_name, model=model,
+                        key_prefix=key[:8], api_format=api_format, is_stream=is_stream,
+                        status_code=504, success=False, matched_rule=None,
+                        usage={}, t0=t0, error="upstream timeout",
+                    )
+                    return JSONResponse(
+                        status_code=504,
+                        content={"error": "upstream timeout", "type": "proxy_error"},
+                    )
+                except httpx.ConnectError:
+                    logger.error("Connection failed: provider=%s key=%s", provider_name, key[:8])
+                    self._record(
+                        combo=requested_model, provider=provider_name, model=model,
+                        key_prefix=key[:8], api_format=api_format, is_stream=is_stream,
+                        status_code=502, success=False, matched_rule=None,
+                        usage={}, t0=t0, error="upstream connection failed",
+                    )
+                    return JSONResponse(
+                        status_code=502,
+                        content={"error": "upstream connection failed", "type": "proxy_error"},
+                    )
+
+            attempted_members.add(pair)
+            logger.info(
+                "All keys exhausted for provider=%s model=%s, trying next member",
+                provider_name, model,
             )
-        return JSONResponse(
-            status_code=502,
-            content={"error": "all keys exhausted with errors", "type": "proxy_error"},
-        )
 
     # ------------------------------------------------------------------
-    # Request inspection helpers
+    # Recording helper
+    # ------------------------------------------------------------------
+
+    def _record(
+        self,
+        *,
+        combo: str,
+        provider: str,
+        model: str,
+        key_prefix: str,
+        api_format: str,
+        is_stream: bool,
+        status_code: int | None,
+        success: bool,
+        matched_rule: str | None,
+        usage: dict,
+        t0: float,
+        error: str | None = None,
+    ) -> None:
+        if self._recorder is None:
+            return
+        self._recorder.record({
+            "ts": time.time(),
+            "combo": combo,
+            "provider": provider,
+            "model": model,
+            "key_prefix": key_prefix,
+            "api_format": api_format,
+            "is_stream": 1 if is_stream else 0,
+            "status_code": status_code,
+            "success": 1 if success else 0,
+            "matched_rule": matched_rule,
+            "prompt_tokens": usage.get("prompt_tokens"),
+            "completion_tokens": usage.get("completion_tokens"),
+            "total_tokens": usage.get("total_tokens"),
+            "cache_read_tokens": usage.get("cache_read_tokens"),
+            "cache_write_tokens": usage.get("cache_write_tokens"),
+            "duration_ms": int((perf_counter() - t0) * 1000),
+            "error": error,
+        })
+
+    # ------------------------------------------------------------------
+    # Request helpers
     # ------------------------------------------------------------------
 
     @staticmethod
+    def _extract_model(body: bytes) -> str:
+        try:
+            return str(json.loads(body).get("model", ""))
+        except (json.JSONDecodeError, AttributeError):
+            return ""
+
+    @staticmethod
+    def _rewrite_model(body: bytes, model: str) -> bytes:
+        try:
+            data = json.loads(body)
+            data["model"] = model
+            return json.dumps(data, ensure_ascii=False).encode()
+        except (json.JSONDecodeError, TypeError):
+            return body
+
+    @staticmethod
     def _is_streaming_request(request: Request, body: bytes = b"") -> bool:
-        """Determine whether the client expects a streaming response."""
         accept = request.headers.get("accept", "").lower()
         if "text/event-stream" in accept:
             return True
-        # Also check content-type if the client sends it
         content_type = request.headers.get("content-type", "").lower()
         if "text/event-stream" in content_type:
             return True
@@ -185,37 +328,37 @@ class ProxyService:
 
     @staticmethod
     def _build_headers(request: Request, api_key: str) -> dict[str, str]:
-        """Copy incoming request headers, replace Authorization."""
-        headers = dict(request.headers)
-        headers = _filter_headers(headers)
+        headers = _filter_headers(dict(request.headers))
         headers.pop("authorization", None)
         headers["authorization"] = f"Bearer {api_key}"
         headers.pop("host", None)
+        # Remove content-length so httpx recomputes it from the rewritten body.
+        headers.pop("content-length", None)
         return headers
 
     # ------------------------------------------------------------------
     # Rotation-rule matching
     # ------------------------------------------------------------------
 
-    def _match_rotation_rules(self, body: bytes) -> bool:
-        """Check *body* (raw JSON bytes) against all compiled rotation rules.
-
-        Returns ``True`` if at least one rule matches.
-        """
+    def _match_rotation_rules(
+        self, body: bytes, provider_name: str, model: str
+    ) -> HealthCheckRule | None:
+        """Return the first matching HealthCheckRule, or None."""
         try:
             data = json.loads(body)
         except json.JSONDecodeError:
-            return False
+            return None
 
-        for expr, match_value, match_type, _action in self._rules:
+        for expr, rule in self._provider_rules.get(provider_name, []):
+            if rule.models and model not in rule.models:
+                continue
             for match in expr.find(data):
-                if self._value_matches(match.value, match_value, match_type):
-                    return True
-        return False
+                if self._value_matches(match.value, rule.match_value, rule.match_type):
+                    return rule
+        return None
 
     @staticmethod
     def _value_matches(value: object, match_value: str, match_type: str) -> bool:
-        """Match a JSONPath value using the configured rule mode."""
         value_text = str(value)
         if match_type == "contains":
             return match_value in value_text
@@ -223,39 +366,24 @@ class ProxyService:
             return re.search(match_value, value_text) is not None
         return value_text == match_value
 
-
-
     # ------------------------------------------------------------------
     # Non-streaming proxy
     # ------------------------------------------------------------------
 
     async def _proxy_non_streaming(
         self,
+        target_url: str,
         headers: dict[str, str],
         body: bytes,
-        key: str,
-    ) -> tuple[Response | None, bytes | None, int | None]:
-        """POST to upstream and check the full response for rotation triggers.
-
-        Returns ``(Response, None, None)`` on success, or
-        ``(None, error_body_bytes, status_code)`` when a rotation rule
-        matched (caller should retry with the next key).
-        """
-        upstream_resp = await self.client.post(
-            self.config.proxy.target_url,
-            headers=headers,
-            content=body,
-        )
+        provider_name: str,
+        model: str,
+    ) -> tuple[Response | None, HealthCheckRule | None]:
+        upstream_resp = await self.client.post(target_url, headers=headers, content=body)
         resp_body = await upstream_resp.aread()
 
-        should_rotate = self._match_rotation_rules(resp_body)
-        self.key_manager.record_usage(key, is_error=should_rotate)
-
-        if should_rotate:
-            logger.info(
-                "Rotation triggered by error (key=%s → next)", key[:8]
-            )
-            return None, resp_body, upstream_resp.status_code
+        matched_rule = self._match_rotation_rules(resp_body, provider_name, model)
+        if matched_rule is not None:
+            return None, matched_rule
 
         resp_headers = _filter_response_headers(dict(upstream_resp.headers))
         return (
@@ -266,7 +394,6 @@ class ProxyService:
                 media_type=upstream_resp.headers.get("content-type"),
             ),
             None,
-            None,
         )
 
     # ------------------------------------------------------------------
@@ -275,50 +402,58 @@ class ProxyService:
 
     async def _proxy_streaming(
         self,
+        target_url: str,
         headers: dict[str, str],
         body: bytes,
-        key: str,
-    ) -> tuple[Response | None, bytes | None, int | None]:
-        """Proxy a streaming (SSE) request with error detection.
-
-        Buffers the first SSE event (delimited by ``\\n\\n``).
-        If an error is found ``(None, None, None)`` is returned so the caller
-        retries with the next key (status/body are not meaningful for SSE).
-
-        If no error is found ``(StreamingResponse, None, None)`` is returned.
-        """
-        request = self.client.build_request(
-            "POST",
-            self.config.proxy.target_url,
-            headers=headers,
-            content=body,
-        )
-        upstream_resp = await self.client.send(request, stream=True)
+        provider_name: str,
+        model: str,
+        *,
+        combo: str = "",
+        key: str = "",
+        t0: float = 0.0,
+        api_format: str = "",
+    ) -> tuple[Response | None, HealthCheckRule | None]:
+        req = self.client.build_request("POST", target_url, headers=headers, content=body)
+        upstream_resp = await self.client.send(req, stream=True)
         resp_headers = _filter_response_headers(dict(upstream_resp.headers))
         media_type = upstream_resp.headers.get("content-type", "text/event-stream")
+        status_code = upstream_resp.status_code
 
         if "text/event-stream" not in media_type.lower():
             resp_body = await upstream_resp.aread()
             await upstream_resp.aclose()
-            should_rotate = self._match_rotation_rules(resp_body)
-            self.key_manager.record_usage(key, is_error=should_rotate)
-            if should_rotate:
-                logger.info(
-                    "Streaming request received JSON rotation error (key=%s -> next)",
-                    key[:8],
+            matched_rule = self._match_rotation_rules(resp_body, provider_name, model)
+            if matched_rule is not None:
+                return None, matched_rule
+            # Non-SSE error response (e.g. 404, 400) — record and pass through
+            if status_code >= 400:
+                err_text: str | None = None
+                try:
+                    err_obj = json.loads(resp_body).get("error", {})
+                    if isinstance(err_obj, dict):
+                        err_text = err_obj.get("message") or str(err_obj)
+                    else:
+                        err_text = str(err_obj)
+                except Exception:
+                    err_text = resp_body.decode(errors="replace")[:200]
+                self._record(
+                    combo=combo, provider=provider_name, model=model,
+                    key_prefix=key[:8] if key else "",
+                    api_format=api_format, is_stream=True,
+                    status_code=status_code, success=False,
+                    matched_rule=None, usage={}, t0=t0, error=err_text,
                 )
-                return None, resp_body, upstream_resp.status_code
             return (
                 Response(
                     content=resp_body,
-                    status_code=upstream_resp.status_code,
+                    status_code=status_code,
                     headers=resp_headers,
                     media_type=media_type,
                 ),
                 None,
-                None,
             )
 
+        # Buffer until first SSE event boundary
         buffer = bytearray()
         upstream_iter = upstream_resp.aiter_bytes()
         while True:
@@ -332,56 +467,168 @@ class ProxyService:
 
         first_chunk = bytes(buffer)
 
-        if first_chunk and self._check_sse_error(first_chunk):
-            logger.info(
-                "Streaming rotation triggered by error event (key=%s → next)",
-                key[:8],
-            )
-            self.key_manager.record_usage(key, is_error=True)
+        matched_rule = self._check_sse_error(first_chunk, provider_name, model)
+        if matched_rule is not None:
             await upstream_resp.aclose()
-            return None, first_chunk, upstream_resp.status_code
+            return None, matched_rule
 
-        self.key_manager.record_usage(key, is_error=False)
+        # Capture references for the closure
+        recorder = self._recorder
+        record_fn = self._record
+        # Usage sniffing state: pending holds cross-chunk partial SSE lines
+        usage_holder: dict = {"pending": bytearray(), "usage": {}}
 
         async def _forward() -> AsyncGenerator[bytes, None]:
             try:
                 if first_chunk:
+                    _sniff_usage_chunk(first_chunk, api_format, usage_holder)
                     yield first_chunk
                 async for chunk in upstream_iter:
+                    _sniff_usage_chunk(chunk, api_format, usage_holder)
                     yield chunk
             finally:
                 await upstream_resp.aclose()
+                if recorder is not None:
+                    record_fn(
+                        combo=combo, provider=provider_name, model=model,
+                        key_prefix=key[:8] if key else "",
+                        api_format=api_format, is_stream=True,
+                        status_code=status_code, success=status_code < 400,
+                        matched_rule=None,
+                        usage=usage_holder["usage"],
+                        t0=t0,
+                    )
 
         return (
             StreamingResponse(
                 content=_forward(),
-                status_code=upstream_resp.status_code,
+                status_code=status_code,
                 headers=resp_headers,
                 media_type=media_type,
             ),
             None,
-            None,
         )
 
-    # ------------------------------------------------------------------
-    # SSE error detection
-    # ------------------------------------------------------------------
-
-    def _check_sse_error(self, sse_data: bytes) -> bool:
-        """Parse SSE text and check each ``data:`` JSON against rotation rules."""
+    def _check_sse_error(
+        self, sse_data: bytes, provider_name: str, model: str
+    ) -> HealthCheckRule | None:
         text = sse_data.decode("utf-8", errors="replace")
         for line in text.split("\n"):
             line = line.strip()
-            if line.startswith("data:"):
-                json_str = line[5:].strip()
-                if json_str == "[DONE]":
+            if not line.startswith("data:"):
+                continue
+            json_str = line[5:].strip()
+            if json_str == "[DONE]":
+                continue
+            try:
+                parsed = json.loads(json_str)
+            except json.JSONDecodeError:
+                continue
+            for expr, rule in self._provider_rules.get(provider_name, []):
+                if rule.models and model not in rule.models:
                     continue
-                try:
-                    parsed = json.loads(json_str)
-                except json.JSONDecodeError:
-                    continue
-                for expr, match_value, match_type, _action in self._rules:
-                    for m in expr.find(parsed):
-                        if self._value_matches(m.value, match_value, match_type):
-                            return True
-        return False
+                for m in expr.find(parsed):
+                    if self._value_matches(m.value, rule.match_value, rule.match_type):
+                        return rule
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Module-level token-extraction utilities
+# ---------------------------------------------------------------------------
+
+def _extract_usage(body: bytes, api_format: str) -> dict:
+    """Parse the ``usage`` field from a completed (non-streaming) response body.
+
+    Returns a dict with keys ``prompt_tokens``, ``completion_tokens``,
+    ``total_tokens``, ``cache_read_tokens``, ``cache_write_tokens``
+    (all may be None if parsing fails or fields are absent).
+    """
+    try:
+        data = json.loads(body)
+    except (json.JSONDecodeError, ValueError):
+        return {}
+    u = data.get("usage") or {}
+    if api_format == "anthropic":
+        inp = u.get("input_tokens")
+        out = u.get("output_tokens")
+        total = (inp + out) if (inp is not None and out is not None) else None
+        return {
+            "prompt_tokens": inp,
+            "completion_tokens": out,
+            "total_tokens": total,
+            "cache_read_tokens": u.get("cache_read_input_tokens"),
+            "cache_write_tokens": u.get("cache_creation_input_tokens"),
+        }
+    # OpenAI / openai-responses format
+    details = u.get("prompt_tokens_details") or {}
+    return {
+        "prompt_tokens": u.get("prompt_tokens"),
+        "completion_tokens": u.get("completion_tokens"),
+        "total_tokens": u.get("total_tokens"),
+        "cache_read_tokens": details.get("cached_tokens"),
+        "cache_write_tokens": None,  # OpenAI does not expose cache write count
+    }
+
+
+def _sniff_usage_chunk(chunk: bytes, api_format: str, holder: dict) -> None:
+    """Sniff token usage from an SSE chunk, updating *holder* in place.
+
+    *holder* must have keys ``"pending"`` (bytearray) and ``"usage"`` (dict).
+    Cross-chunk SSE line boundaries are handled via the ``pending`` buffer.
+
+    For OpenAI streams:  the final data chunk with ``usage`` present
+    (requires ``stream_options.include_usage=true`` in the request) is parsed.
+    For Anthropic streams: ``message_start`` input_tokens +
+    ``message_delta`` output_tokens are accumulated.
+    """
+    pending: bytearray = holder["pending"]
+    pending.extend(chunk)
+    # Process complete lines only (split on \n, keep trailing partial)
+    text = pending.decode("utf-8", errors="replace")
+    lines = text.split("\n")
+    holder["pending"] = bytearray(lines[-1].encode("utf-8", errors="replace"))
+
+    for raw_line in lines[:-1]:
+        line = raw_line.strip()
+        if not line.startswith("data:"):
+            continue
+        json_str = line[5:].strip()
+        if json_str == "[DONE]":
+            continue
+        try:
+            event = json.loads(json_str)
+        except json.JSONDecodeError:
+            continue
+
+        if api_format == "anthropic":
+            # message_start: {"type":"message_start","message":{"usage":{"input_tokens":N}}}
+            if event.get("type") == "message_start":
+                u = (event.get("message") or {}).get("usage") or {}
+                if u.get("input_tokens") is not None:
+                    holder["usage"]["prompt_tokens"] = u["input_tokens"]
+                if u.get("cache_read_input_tokens") is not None:
+                    holder["usage"]["cache_read_tokens"] = u["cache_read_input_tokens"]
+                if u.get("cache_creation_input_tokens") is not None:
+                    holder["usage"]["cache_write_tokens"] = u["cache_creation_input_tokens"]
+            # message_delta: {"type":"message_delta","usage":{"output_tokens":N}}
+            elif event.get("type") == "message_delta":
+                u = event.get("usage") or {}
+                if u.get("output_tokens") is not None:
+                    holder["usage"]["completion_tokens"] = u["output_tokens"]
+                    inp = holder["usage"].get("prompt_tokens")
+                    out = u["output_tokens"]
+                    holder["usage"]["total_tokens"] = (
+                        (inp + out) if inp is not None else out
+                    )
+        else:
+            # OpenAI: final chunk with usage field (stream_options.include_usage=true)
+            u = event.get("usage") or {}
+            if u.get("total_tokens") is not None:
+                holder["usage"]["prompt_tokens"] = u.get("prompt_tokens")
+                holder["usage"]["completion_tokens"] = u.get("completion_tokens")
+                holder["usage"]["total_tokens"] = u.get("total_tokens")
+                details = u.get("prompt_tokens_details") or {}
+                cached = details.get("cached_tokens")
+                if cached is not None:
+                    holder["usage"]["cache_read_tokens"] = cached

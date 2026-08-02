@@ -3,7 +3,7 @@ name: Publish to PyPI
 on:
   push:
     tags:
-      - 'v*' # Trigger on version tags, e.g., v0.1.0
+      - 'v*'
 
 permissions:
   contents: read
@@ -14,6 +14,22 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # hatch-vcs needs full history to resolve version from git tags
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: web/package-lock.json
+
+      - name: Build frontend
+        working-directory: web
+        run: |
+          npm ci
+          npm run build
+        # Outputs to sense_roll/web/dist/ (see vite.config.ts outDir)
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -25,6 +41,7 @@ jobs:
 
       - name: Build package
         run: uv build
+        # sense_roll/web/dist is included via pyproject.toml artifacts
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4

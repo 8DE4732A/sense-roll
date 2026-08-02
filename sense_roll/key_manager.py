@@ -1,10 +1,18 @@
-"""Key manager with round-robin rotation and cooldown."""
+"""Per-provider key manager with (key, model) granularity cooldown."""
 
 from __future__ import annotations
 
 import threading
 import time
 from dataclasses import dataclass
+
+
+@dataclass
+class ModelCooldown:
+    """Cooldown state for a specific (key, model) combination."""
+
+    last_error_at: float
+    cooldown_seconds: int
 
 
 @dataclass
@@ -15,186 +23,153 @@ class KeyStats:
     use_count: int = 0
     error_count: int = 0
     last_used_at: float | None = None
-    last_error_at: float | None = None
 
 
-class KeyManager:
-    """Manages a list of API keys with round-robin rotation and cooldown.
+class ProviderKeyManager:
+    """Manages a list of API keys for one provider.
+
+    Tracks cooldown at (key_index, model) granularity so that a quota
+    error on model A does not affect model B for the same key.
 
     Thread-safe: all public methods acquire the internal lock.
     """
 
     def __init__(
         self,
+        provider_name: str,
         keys: list[str],
-        cooldown_seconds: int = 60,
         strategy: str = "fill-first",
     ) -> None:
         if not keys:
-            raise ValueError("At least one API key is required")
-
+            raise ValueError(f"Provider {provider_name!r} must have at least one key")
+        self.provider_name = provider_name
         self._keys = list(keys)
-        self._index = 0
-        self._cooldown_seconds = cooldown_seconds
         self._strategy = strategy
+        self._rr_index = 0
         self._lock = threading.Lock()
-        self._stats: dict[int, KeyStats] = {}
-        for i, key in enumerate(self._keys):
-            self._stats[i] = KeyStats(key_prefix=key[: min(8, len(key))])
+        self._stats: dict[int, KeyStats] = {
+            i: KeyStats(key_prefix=k[: min(8, len(k))])
+            for i, k in enumerate(self._keys)
+        }
+        self._cooldowns: dict[tuple[int, str], ModelCooldown] = {}
 
     # ------------------------------------------------------------------
     # Private helpers (caller must hold _lock)
     # ------------------------------------------------------------------
 
-    def _is_available(self, stat: KeyStats, now: float | None = None) -> bool:
-        """Check whether *stat* is out of cooldown at time *now*."""
-        if stat.last_error_at is None:
+    def _is_available(self, key_idx: int, model: str, now: float) -> bool:
+        entry = self._cooldowns.get((key_idx, model))
+        if entry is None:
             return True
-        return (now or time.time()) - stat.last_error_at >= self._cooldown_seconds
-
-    def _advance_index(self) -> None:
-        """Advance index by one (round-robin).  Caller must hold _lock."""
-        self._index = (self._index + 1) % len(self._keys)
+        return now - entry.last_error_at >= entry.cooldown_seconds
 
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
 
-    def get_current_key(self) -> str:
-        """Return the current (active) API key.
-
-        Thread-safe: does NOT mutate state.
-        """
-        with self._lock:
-            if self._strategy == "fill-first":
-                now = time.time()
-                for i, key in enumerate(self._keys):
-                    if self._is_available(self._stats[i], now):
-                        return key
-                return self._keys[0]
-            else:
-                return self._keys[self._index]
-
-    def get_current_key_prefix(self) -> str:
-        """Return the prefix of the current key (for safe display)."""
-        with self._lock:
-            if self._strategy == "fill-first":
-                now = time.time()
-                for i, key in enumerate(self._keys):
-                    if self._is_available(self._stats[i], now):
-                        return self._stats[i].key_prefix
-                return self._stats[0].key_prefix
-            else:
-                return self._stats[self._index].key_prefix
-
-    def get_key(self, attempted_keys: set[str] | None = None) -> str | None:
-        """Get the next key to use, based on the routing strategy and availability.
-
-        Respects cooldowns and excludes any keys in `attempted_keys`.
-        """
+    def get_key(self, model: str, attempted_keys: set[str] | None = None) -> str | None:
+        """Return the next usable key for *model*, or None if all are cooling down."""
         if attempted_keys is None:
             attempted_keys = set()
 
         with self._lock:
             now = time.time()
             if self._strategy == "fill-first":
-                # Fill-first: always check from the beginning of the list
                 for i, key in enumerate(self._keys):
-                    if key not in attempted_keys and self._is_available(self._stats[i], now):
+                    if key not in attempted_keys and self._is_available(i, model, now):
                         return key
                 return None
             else:
-                # Round-robin: advance index and find the next available, untried key
+                # Round-robin: scan forward from current index, wrap once
                 for _ in range(len(self._keys)):
-                    self._advance_index()
-                    key = self._keys[self._index]
-                    if key not in attempted_keys and self._is_available(self._stats[self._index], now):
+                    self._rr_index = (self._rr_index + 1) % len(self._keys)
+                    key = self._keys[self._rr_index]
+                    if key not in attempted_keys and self._is_available(self._rr_index, model, now):
                         return key
                 return None
 
-    def rotate(self) -> str:
-        """Advance to the next key (round-robin) and return it.
+    def merge_stats_from(self, old: "ProviderKeyManager") -> None:
+        """Migrate per-key usage stats and unexpired cooldowns from *old* into self.
 
-        Thread-safe: acquires the lock.
+        Matching is done by key string (not index) so that re-ordering or adding/
+        removing keys does not corrupt data.  Keys absent from *old* start fresh;
+        keys removed from *old* are silently discarded.
+
+        Thread-safe: acquires both locks in a consistent order (old then self).
+        Callers must ensure *old* is no longer being written to after this call.
         """
-        with self._lock:
-            self._advance_index()
-            return self._keys[self._index]
+        with old._lock:  # noqa: SLF001
+            old_key_index: dict[str, int] = {k: i for i, k in enumerate(old._keys)}  # noqa: SLF001
+            now = time.time()
+            with self._lock:
+                for i, key in enumerate(self._keys):
+                    old_idx = old_key_index.get(key)
+                    if old_idx is None:
+                        continue
+                    old_stat = old._stats[old_idx]  # noqa: SLF001
+                    self._stats[i].use_count = old_stat.use_count
+                    self._stats[i].error_count = old_stat.error_count
+                    self._stats[i].last_used_at = old_stat.last_used_at
+                    # Migrate unexpired (key, model) cooldowns
+                    for (kidx, cd_model), cd in old._cooldowns.items():  # noqa: SLF001
+                        if kidx != old_idx:
+                            continue
+                        if now - cd.last_error_at < cd.cooldown_seconds:
+                            self._cooldowns[(i, cd_model)] = ModelCooldown(
+                                last_error_at=cd.last_error_at,
+                                cooldown_seconds=cd.cooldown_seconds,
+                            )
 
-    def record_usage(self, key: str, is_error: bool = False) -> None:
-        """Record a usage (and optionally an error) for the given key.
-
-        Thread-safe: acquires the lock.
-        """
+    def record_error(self, key: str, model: str, cooldown_seconds: int) -> None:
+        """Mark *key* as cooling down for *model* for *cooldown_seconds*."""
         with self._lock:
             idx = self._keys.index(key)
-            stat = self._stats[idx]
-            stat.use_count += 1
-            now = time.time()
-            stat.last_used_at = now
-            if is_error:
-                stat.error_count += 1
-                stat.last_error_at = now
+            self._stats[idx].error_count += 1
+            self._stats[idx].last_used_at = time.time()
+            self._cooldowns[(idx, model)] = ModelCooldown(
+                last_error_at=time.time(),
+                cooldown_seconds=cooldown_seconds,
+            )
 
-    def is_key_available(self, key: str) -> bool:
-        """Check if the given key is out of cooldown (i.e. usable).
-
-        A key with no recorded error, or whose last error was more than
-        ``cooldown_seconds`` ago, is considered available.
-        """
+    def record_success(self, key: str, model: str) -> None:
+        """Record a successful use of *key* for *model*."""
         with self._lock:
             idx = self._keys.index(key)
-            return self._is_available(self._stats[idx])
+            self._stats[idx].use_count += 1
+            self._stats[idx].last_used_at = time.time()
 
-    def next_available_key(self) -> str | None:
-        """Advance round-robin until an available key is found.
-
-        Returns the key string, or ``None`` if *all* keys are in cooldown.
-        The internal index is updated to the returned key; on ``None`` it is
-        restored to the original position so the next request retries fairly.
-        Thread-safe: acquires the lock.
-        """
-        with self._lock:
-            start = self._index
-            now = time.time()
-            for _ in range(len(self._keys)):
-                self._advance_index()
-                if self._is_available(self._stats[self._index], now):
-                    return self._keys[self._index]
-            # All keys in cooldown – restore original position
-            self._index = start
-            return None
-
-    def get_stats(self) -> list[dict]:
-        """Return a list of per-key usage statistics (safe for API output).
-
-        Only exposes the key prefix (first 8 characters) for security.
-
-        Thread-safe: acquires the lock.
-        """
+    def get_stats(self) -> dict:
+        """Return provider stats including per-key model cooldown details."""
         with self._lock:
             now = time.time()
-            return [
-                {
+            keys_info = []
+            for i, key in enumerate(self._keys):
+                stat = self._stats[i]
+                model_cooldowns: dict[str, dict] = {}
+                for (kidx, model), cd in self._cooldowns.items():
+                    if kidx != i:
+                        continue
+                    elapsed = now - cd.last_error_at
+                    remaining = cd.cooldown_seconds - elapsed
+                    if remaining > 0:
+                        model_cooldowns[model] = {
+                            "available": False,
+                            "seconds_remaining": round(remaining, 1),
+                        }
+                    else:
+                        model_cooldowns[model] = {"available": True}
+                keys_info.append({
                     "key_prefix": stat.key_prefix,
                     "use_count": stat.use_count,
                     "error_count": stat.error_count,
                     "last_used_at": stat.last_used_at,
-                    "last_error_at": stat.last_error_at,
-                    "available": self._is_available(stat, now),
-                }
-                for stat in self._stats.values()
-            ]
-
-    def reset(self) -> None:
-        """Reset the key index to 0 and clear all statistics.
-
-        Thread-safe: acquires the lock.
-        """
-        with self._lock:
-            self._index = 0
-            for i, key in enumerate(self._keys):
-                self._stats[i] = KeyStats(key_prefix=key[: min(8, len(key))])
+                    "model_cooldowns": model_cooldowns,
+                })
+            return {
+                "provider": self.provider_name,
+                "strategy": self._strategy,
+                "keys": keys_info,
+            }
 
     @property
     def total_keys(self) -> int:

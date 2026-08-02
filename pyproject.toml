@@ -1,6 +1,6 @@
 [project]
 name = "sense-roll"
-description = "API Key Rotation Proxy for token.sensenova.cn"
+description = "API Key Rotation Proxy"
 readme = "README.md"
 requires-python = ">=3.12"
 dynamic = ["version"]
@@ -18,9 +18,24 @@ sense-roll = "sense_roll.main:main"
 [tool.hatch.version]
 source = "vcs"
 
+[tool.hatch.build.targets.sdist]
+artifacts = [
+  "sense_roll/web/dist/**/*",
+  "sense_roll/web/dist/*",
+]
+
 [tool.hatch.build.targets.wheel]
 packages = ["sense_roll"]
+artifacts = [
+  "sense_roll/web/dist/**/*",
+  "sense_roll/web/dist/*",
+]
 
 [build-system]
 requires = ["hatchling", "hatch-vcs"]
 build-backend = "hatchling.build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+]

@@ -10,39 +10,52 @@ from fastapi.responses import JSONResponse, Response
 router = APIRouter()
 
 
-def _get_services():
-    """Lazy-import to avoid circular dependency at module load time."""
-    from .main import key_manager, proxy_service  # noqa: PLC0415
-
-    if proxy_service is None or key_manager is None:
+def _get_proxy(request: Request):
+    """Return the current ProxyService snapshot from app.state.gateway."""
+    gateway = getattr(request.app.state, "gateway", None)
+    if gateway is None:
         raise HTTPException(status_code=503, detail="service is not initialised")
-    return proxy_service, key_manager
+    return gateway.service
 
 
 @router.post("/v1/chat/completions")
 async def chat_completions(request: Request) -> Response:
-    """Proxy ``/v1/chat/completions`` to the upstream with key rotation."""
-    proxy_service, _ = _get_services()
-    return await proxy_service.handle_proxy_request(request)
+    """Proxy OpenAI-format requests with combo routing and key rotation."""
+    return await _get_proxy(request).handle_openai_request(request)
+
+
+@router.post("/v1/messages")
+async def messages(request: Request) -> Response:
+    """Proxy Anthropic-format requests with combo routing and key rotation."""
+    return await _get_proxy(request).handle_anthropic_request(request)
+
+
+@router.post("/v1/responses")
+async def responses(request: Request) -> Response:
+    """Proxy OpenAI Responses API requests with combo routing and key rotation."""
+    return await _get_proxy(request).handle_openai_responses_request(request)
+
+
+@router.post("/v1/images/generations")
+async def images_generations(request: Request) -> Response:
+    """Proxy OpenAI Images generations requests with combo routing and key rotation."""
+    return await _get_proxy(request).handle_openai_images_request(request)
 
 
 @router.get("/health")
 async def health_check() -> JSONResponse:
     """Simple health-check endpoint."""
-    return JSONResponse(
-        content={"status": "ok", "timestamp": datetime.now().isoformat()}
-    )
+    return JSONResponse(content={"status": "ok", "timestamp": datetime.now().isoformat()})
 
 
 @router.get("/keys/status")
-async def keys_status() -> JSONResponse:
-    """Return the current key status and per-key usage statistics."""
-    _, km = _get_services()
-    stats = km.get_stats()
-    return JSONResponse(
-        content={
-            "current_key": km.get_current_key_prefix(),
-            "total_keys": km.total_keys,
-            "keys": stats,
-        }
-    )
+async def keys_status(request: Request) -> JSONResponse:
+    """Return combo list and per-provider key statistics."""
+    svc = _get_proxy(request)
+    return JSONResponse(content={
+        "combos": svc.combo_router.list_combos(),
+        "providers": [
+            km.get_stats()
+            for km in svc.provider_key_managers.values()
+        ],
+    })

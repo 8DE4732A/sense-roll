@@ -1,0 +1,145 @@
+# sense-roll 配置 Schema
+# 本文件是结构说明，不可直接用作运行配置。
+# 运行配置请参考 config-example.yaml。
+#
+# 符号约定
+#   <type>        必填字段，类型说明
+#   [<type>]      可选字段，带默认值
+#   |             枚举值分隔符
+
+# ===========================================================================
+# 顶层
+# ===========================================================================
+
+providers:           # list，至少一个 ProviderConfig
+  - <ProviderConfig>
+
+combos:              # list，至少一个 ComboConfig
+  - <ComboConfig>
+
+
+# ===========================================================================
+# ProviderConfig
+# ===========================================================================
+# 表示一个上游服务商。
+# 同一组 key 可通过多个 api 入口支持不同的 API 格式（openai / anthropic / openai-responses）。
+
+ProviderConfig:
+  name:              <string>          # 唯一标识符，供 combo.members 引用
+  api:               <list[ApiEndpoint]>  # 至少一个，不同 api_format 不可重复
+  max_retries:       [int, default=3]  # 在本 provider 内最多尝试几次（含首次）；≥0
+  key_strategy:      [fill-first | round-robin, default=fill-first]
+                                       # fill-first：始终优先第一个可用 key
+                                       # round-robin：轮询分摊请求
+  keys:              <list[KeyConfig]>  # 至少一个
+  health_check_rules: [list[HealthCheckRule], default=[]]
+
+
+# ===========================================================================
+# ApiEndpoint
+# ===========================================================================
+# 一个 (api_format, base_url) 对，决定请求转发到哪个路径。
+
+ApiEndpoint:
+  api_format:  <openai | anthropic | openai-responses>
+               # openai           → POST {base_url}/chat/completions
+               # anthropic        → POST {base_url}/messages
+               # openai-responses → POST {base_url}/responses
+  base_url:    <string>   # 上游 base URL，末尾 / 会被自动去掉
+
+
+# ===========================================================================
+# KeyConfig
+# ===========================================================================
+
+KeyConfig:
+  key:  <string>   # API 密钥明文，不可为空
+
+
+# ===========================================================================
+# HealthCheckRule
+# ===========================================================================
+# 当上游响应（或 SSE 首帧）的 JSON 匹配规则时，触发 key 轮换并进入冷却。
+# 冷却粒度为 (key, model)，不同模型互不影响。
+
+HealthCheckRule:
+  description:      [string, default=""]    # 可读标注，出现在日志和统计里
+  jsonpath:         [string, default="$.error.type"]
+                                            # JSONPath 表达式，定位响应中的字段
+  match_value:      [string, default="quota_exceeded_error"]
+                                            # 与 JSONPath 结果比较的目标值
+  match_type:       [equals | contains | regex, default=equals]
+                                            # equals：完全相等
+                                            # contains：子串匹配
+                                            # regex：Python re.search
+  action:           [rotate, default=rotate]  # 目前仅支持 rotate
+  cooldown_seconds: [int, default=60]       # 触发后该 (key, model) 的冷却时长（秒）；≥0
+  models:           [list[string], default=[]]
+                                            # 限定生效的模型 ID；空列表 = 所有模型
+
+
+# ===========================================================================
+# ComboConfig
+# ===========================================================================
+# 客户端使用的「虚拟模型名」。
+# 请求体的 model 字段填 combo 名称，代理路由后改写为 member 的真实 model。
+
+ComboConfig:
+  name:        <string>                    # 唯一标识符，即客户端传的 model 值
+  api_format:  <format | list[format]>     # 单值或列表，决定此 combo 接受哪些端点
+                                           # openai           → /v1/chat/completions
+                                           # anthropic        → /v1/messages
+                                           # openai-responses → /v1/responses
+                                           # 列表时同时支持多个端点
+  strategy:    [fill-first | round-robin, default=fill-first]
+                                           # fill-first：优先第一个 member，耗尽才切换
+                                           # round-robin：每次请求轮询 member
+  members:     <list[ComboMember]>         # 至少一个
+
+
+# ===========================================================================
+# ComboMember
+# ===========================================================================
+# (provider, model) 对，按 strategy 顺序选用。
+
+ComboMember:
+  provider:  <string>   # 必须与某个 ProviderConfig.name 一致
+             # provider 必须包含与 combo.api_format 匹配的 ApiEndpoint
+  model:     <string>   # 转发给上游的真实模型 ID
+
+
+# ===========================================================================
+# 完整请求流程
+# ===========================================================================
+#
+# 1. 客户端 → POST /v1/chat/completions（或 /v1/messages、/v1/responses）
+#    请求体 {"model": "<combo_name>", ...}
+#
+# 2. 代理根据 combo_name 找到 ComboConfig，验证端点格式匹配
+#
+# 3. 按 combo.strategy 选 (provider, model) 成员：
+#    - fill-first：顺序尝试，当前 member 的所有 key 耗尽才切下一个
+#    - round-robin：每次请求轮换到不同 member
+#
+# 4. 在选中的 provider 内，按 key_strategy 选 key：
+#    - 发送请求（改写 model 字段 + 替换 Authorization header）
+#    - 若命中 health_check_rule → 该 (key, model) 进入冷却，换 key 重试
+#    - 若所有 key 冷却中 → 换下一个 combo member
+#    - 若所有 member 耗尽 → 返回 503
+#
+# 5. 成功响应原样透传（流式 SSE 逐 chunk 转发）
+#
+# ===========================================================================
+# 端点 → api_format 对应表
+# ===========================================================================
+#
+#   POST /v1/chat/completions  ←→  openai
+#   POST /v1/messages          ←→  anthropic
+#   POST /v1/responses         ←→  openai-responses
+#
+# GET  /health                     健康检查
+# GET  /keys/status                实时 key 池状态
+# GET  /admin/                     管理页面（需构建 web/dist）
+# GET  /admin/api/config           查看/编辑配置
+# GET  /admin/api/stats/summary    聚合统计
+# GET  /admin/api/requests         请求明细
