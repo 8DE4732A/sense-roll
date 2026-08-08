@@ -102,12 +102,16 @@ class ComboConfig:
     ``api_formats`` lists all API formats this combo accepts (e.g. both
     ``openai`` and ``anthropic``).  A single combo entry therefore serves
     both /v1/chat/completions and /v1/messages without duplication.
+
+    ``aliases`` are additional names that resolve to this combo, allowing
+    clients to request by any of the listed model IDs.
     """
 
     name: str
     api_formats: list[str]
     strategy: str = "fill-first"
     members: list[ComboMember] = field(default_factory=list)
+    aliases: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -116,6 +120,15 @@ class AppConfig:
 
     providers: list[ProviderConfig] = field(default_factory=list)
     combos: list[ComboConfig] = field(default_factory=list)
+
+
+def _coerce_to_list(raw: object, context: str) -> list:
+    """Coerce a string-or-list field to list, raising ConfigError on wrong type."""
+    if isinstance(raw, str):
+        raw = [raw]
+    if not isinstance(raw, list):
+        raise ConfigError(f"{context} must be a list")
+    return raw  # type: ignore[return-value]
 
 
 def _parse_health_check_rule(entry: dict, idx: int, context: str) -> HealthCheckRule:
@@ -278,11 +291,20 @@ def build_config(raw: dict) -> AppConfig:
             raise ConfigError(f"Duplicate combo name: {name!r}")
         combo_names.add(name)
 
+        aliases_raw = _coerce_to_list(c.get("aliases", []), f"combos[{i}].aliases")
+        aliases: list[str] = []
+        for k, a in enumerate(aliases_raw):
+            alias = str(a).strip()
+            if not alias:
+                raise ConfigError(f"combos[{i}].aliases[{k}] must not be empty")
+            if alias in combo_names:
+                raise ConfigError(f"combos[{i}].aliases[{k}] {alias!r} conflicts with an existing combo name or alias")
+            combo_names.add(alias)
+            aliases.append(alias)
+
         # api_format may be a single string or a list
-        fmt_raw = c.get("api_format", [])
-        if isinstance(fmt_raw, str):
-            fmt_raw = [fmt_raw]
-        if not isinstance(fmt_raw, list) or not fmt_raw:
+        fmt_raw = _coerce_to_list(c.get("api_format", []), f"combos[{i}].api_format")
+        if not fmt_raw:
             raise ConfigError(
                 f"combos[{i}].api_format must be a non-empty string or list"
             )
@@ -334,6 +356,7 @@ def build_config(raw: dict) -> AppConfig:
             api_formats=api_formats,
             strategy=strategy,
             members=members,
+            aliases=aliases,
         ))
 
     return AppConfig(providers=providers, combos=combos)
@@ -390,6 +413,7 @@ def dump_config(cfg: AppConfig) -> dict:
                     {"provider": m.provider, "model": m.model}
                     for m in c.members
                 ],
+                **({"aliases": c.aliases} if c.aliases else {}),
             }
             for c in cfg.combos
         ],

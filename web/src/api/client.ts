@@ -46,11 +46,30 @@ export type ComboMember = { provider: string; model: string }
 
 export type ApiFormat = 'openai' | 'anthropic' | 'openai-responses' | 'openai-images'
 
+export const FMT_ENDPOINT: Record<ApiFormat, string> = {
+  'openai': '/v1/chat/completions',
+  'anthropic': '/v1/messages',
+  'openai-responses': '/v1/responses',
+  'openai-images': '/v1/images/generations',
+}
+
+export const FMT_COLOR: Record<ApiFormat, string> = {
+  'openai': 'green',
+  'anthropic': 'blue',
+  'openai-responses': 'amber',
+  'openai-images': 'amber',
+}
+
+export function normalizeFormats(v: ApiFormat | ApiFormat[]): ApiFormat[] {
+  return Array.isArray(v) ? v : [v]
+}
+
 export type ComboConfig = {
   name: string
   api_format: ApiFormat | ApiFormat[]
   strategy: 'fill-first' | 'round-robin'
   members: ComboMember[]
+  aliases?: string[]
 }
 
 export type AppConfig = {
@@ -158,6 +177,28 @@ export const getRequests = (params: {
   })
   return request<RequestsResp>(`/requests?${qs}`)
 }
+
+// ---- Info ----
+export type InfoCombo = {
+  name: string
+  aliases: string[]
+  api_formats: string[]
+  strategy: string
+  members: { provider: string; model: string }[]
+}
+export type InfoProvider = {
+  name: string
+  api_formats: string[]
+  key_count: number
+  strategy: string
+}
+export type AdminInfo = {
+  version: string
+  python: string
+  combos: InfoCombo[]
+  providers: InfoProvider[]
+}
+export const getAdminInfo = () => request<AdminInfo>('/info')
 
 // ---- Health ----
 export type AdminHealth = {

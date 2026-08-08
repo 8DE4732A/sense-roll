@@ -1,22 +1,10 @@
 import { useEffect, useState } from 'react'
-import { getConfig, putConfig } from '../api/client'
+import { getConfig, putConfig, FMT_ENDPOINT, FMT_COLOR, normalizeFormats } from '../api/client'
 import type {
   AppConfig, ProviderConfig, ComboConfig, HealthCheckRule, ComboMember, ApiEndpoint, ApiFormat,
 } from '../api/client'
 
 const ALL_FORMATS: ApiFormat[] = ['openai', 'anthropic', 'openai-responses', 'openai-images']
-const FMT_PATH: Record<ApiFormat, string> = {
-  'openai': '/v1/chat/completions',
-  'anthropic': '/v1/messages',
-  'openai-responses': '/v1/responses',
-  'openai-images': '/v1/images/generations',
-}
-const FMT_COLOR: Record<ApiFormat, string> = {
-  'openai': 'green',
-  'anthropic': 'blue',
-  'openai-responses': 'amber',
-  'openai-images': 'amber',
-}
 
 const EMPTY_ENDPOINT = (): ApiEndpoint => ({ api_format: 'openai', base_url: '' })
 const EMPTY_RULE = (): HealthCheckRule => ({
@@ -29,12 +17,9 @@ const EMPTY_PROVIDER = (): ProviderConfig => ({
 })
 const EMPTY_COMBO = (): ComboConfig => ({
   name: '', api_format: ['openai'], strategy: 'fill-first',
-  members: [{ provider: '', model: '' }],
+  members: [{ provider: '', model: '' }], aliases: [],
 })
 
-function normalizeFormats(v: ApiFormat | ApiFormat[]): ApiFormat[] {
-  return Array.isArray(v) ? v : [v]
-}
 
 // ── Icons ────────────────────────────────────────────────────────
 function IconPlus() {
@@ -316,6 +301,17 @@ function ComboDetail({
         <FieldRow label="名称" hint="客户端 model 字段填此值">
           <input value={cb.name} placeholder="fast" onChange={e => onUpdate({ name: e.target.value })} />
         </FieldRow>
+        <FieldRow label="别名" hint="其他可用的 model ID，逗号分隔">
+          <input
+            value={(cb.aliases ?? []).join(', ')}
+            placeholder="gpt-4o, claude-3-5-sonnet-20241022"
+            onChange={e => {
+              const raw = e.target.value
+              const aliases = raw.split(',').map(s => s.trim()).filter(Boolean)
+              onUpdate({ aliases })
+            }}
+          />
+        </FieldRow>
         <FieldRow label="策略">
           <select value={cb.strategy}
             onChange={e => onUpdate({ strategy: e.target.value as ComboConfig['strategy'] })}
@@ -354,7 +350,7 @@ function ComboDetail({
                   fontWeight: checked ? 500 : 400,
                 }}>{f}</span>
                 <span style={{ fontSize: 11, color: checked ? 'var(--accent-dim)' : 'var(--text-3)', marginLeft: 4 }}>
-                  {FMT_PATH[f]}
+                  {FMT_ENDPOINT[f]}
                 </span>
               </label>
             )
@@ -417,7 +413,7 @@ export default function ConfigEditor() {
     getConfig()
       .then(raw => setCfg({
         ...raw,
-        combos: raw.combos.map(c => ({ ...c, api_format: normalizeFormats(c.api_format) })),
+        combos: raw.combos.map(c => ({ aliases: [], ...c, api_format: normalizeFormats(c.api_format) })),
       }))
       .catch(e => setErr(String(e)))
   }, [])
@@ -575,6 +571,11 @@ export default function ConfigEditor() {
                     {!isProvider && (
                       <span className="tag" style={{ fontSize: 10, padding: '1px 5px' }}>
                         {cb.members.length}m
+                      </span>
+                    )}
+                    {!isProvider && (cb.aliases ?? []).length > 0 && (
+                      <span className="tag" style={{ fontSize: 10, padding: '1px 5px', color: 'var(--text-2)' }}>
+                        +{(cb.aliases ?? []).length}别名
                       </span>
                     )}
                   </div>

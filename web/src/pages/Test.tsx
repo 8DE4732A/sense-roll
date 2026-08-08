@@ -1,19 +1,30 @@
 import { useEffect, useRef, useState } from 'react'
-import { getConfig } from '../api/client'
+import { getConfig, FMT_ENDPOINT, normalizeFormats } from '../api/client'
 import type { AppConfig, ApiFormat } from '../api/client'
 
 type SendState = 'idle' | 'sending' | 'streaming' | 'done' | 'error'
+type OutputBlock = { type: 'thinking' | 'text'; content: string }
 
-const FMT_ENDPOINT: Record<ApiFormat, string> = {
-  'openai': '/v1/chat/completions',
-  'anthropic': '/v1/messages',
-  'openai-responses': '/v1/responses',
-  'openai-images': '/v1/images/generations',
-}
+type ThinkingLevel = 'off' | 'low' | 'medium' | 'high'
 
-function buildBody(fmt: ApiFormat, model: string, prompt: string, stream: boolean, imageSize?: string): unknown {
+const ANTHROPIC_BUDGET: Record<ThinkingLevel, number> = { off: 0, low: 1024, medium: 8000, high: 32000 }
+
+function buildBody(
+  fmt: ApiFormat,
+  model: string,
+  prompt: string,
+  stream: boolean,
+  imageSize?: string,
+  thinking: ThinkingLevel = 'off',
+): unknown {
   if (fmt === 'anthropic') {
-    return { model, messages: [{ role: 'user', content: prompt }], max_tokens: 2048 }
+    const maxTokens = thinking !== 'off' ? Math.max(ANTHROPIC_BUDGET[thinking] + 1024, 4096) : 2048
+    return {
+      model,
+      messages: [{ role: 'user', content: prompt }],
+      max_tokens: maxTokens,
+      ...(thinking !== 'off' ? { thinking: { type: 'enabled', budget_tokens: ANTHROPIC_BUDGET[thinking] } } : {}),
+    }
   }
   if (fmt === 'openai-responses') {
     return { model, input: prompt }
@@ -27,6 +38,7 @@ function buildBody(fmt: ApiFormat, model: string, prompt: string, stream: boolea
     messages: [{ role: 'user', content: prompt }],
     stream,
     ...(stream ? { stream_options: { include_usage: true } } : {}),
+    ...(thinking !== 'off' ? { reasoning_effort: thinking } : {}),
   }
 }
 
@@ -44,9 +56,10 @@ function parseUsage(text: string, fmt: ApiFormat): { prompt?: number; completion
   } catch { return null }
 }
 
-function extractStreamText(chunk: string, fmt: ApiFormat): { text?: string; usage?: ReturnType<typeof parseUsage> } {
+function extractStreamText(chunk: string, fmt: ApiFormat): { text?: string; thinking?: string; usage?: ReturnType<typeof parseUsage> } {
   const lines = chunk.split('\n')
   let text = ''
+  let thinkingText = ''
   let usage: ReturnType<typeof parseUsage> = null
   for (const line of lines) {
     if (!line.startsWith('data: ')) continue
@@ -55,11 +68,15 @@ function extractStreamText(chunk: string, fmt: ApiFormat): { text?: string; usag
     try {
       const obj = JSON.parse(data)
       if (fmt === 'openai') {
-        const delta = obj.choices?.[0]?.delta?.content
-        if (delta) text += delta
+        const delta = obj.choices?.[0]?.delta
+        if (delta?.content) text += delta.content
+        if (delta?.reasoning_content) thinkingText += delta.reasoning_content
         if (obj.usage) usage = { prompt: obj.usage.prompt_tokens, completion: obj.usage.completion_tokens, total: obj.usage.total_tokens }
       } else if (fmt === 'anthropic') {
-        if (obj.type === 'content_block_delta' && obj.delta?.text) text += obj.delta.text
+        if (obj.type === 'content_block_delta') {
+          if (obj.delta?.type === 'thinking_delta') thinkingText += obj.delta.thinking ?? ''
+          else if (obj.delta?.type === 'text_delta' || obj.delta?.text) text += obj.delta.text ?? ''
+        }
         if (obj.type === 'message_start' && obj.message?.usage) {
           const u = obj.message.usage
           usage = { prompt: u.input_tokens, completion: u.output_tokens, total: (u.input_tokens ?? 0) + (u.output_tokens ?? 0) }
@@ -70,7 +87,7 @@ function extractStreamText(chunk: string, fmt: ApiFormat): { text?: string; usag
       }
     } catch { /* skip malformed */ }
   }
-  return { text, usage: usage ?? undefined }
+  return { text: text || undefined, thinking: thinkingText || undefined, usage: usage ?? undefined }
 }
 
 function fmtElapsed(ms: number) {
@@ -100,8 +117,32 @@ function CopyIcon() {
   )
 }
 
-function normalizeFormats(v: ApiFormat | ApiFormat[]): ApiFormat[] {
-  return Array.isArray(v) ? v : [v]
+function blocksFrom(thinking: string, text: string): OutputBlock[] {
+  return [
+    ...(thinking ? [{ type: 'thinking' as const, content: thinking }] : []),
+    ...(text     ? [{ type: 'text'     as const, content: text     }] : []),
+  ]
+}
+
+function parseNonStreamBlocks(fmt: ApiFormat, obj: unknown, rawText: string): OutputBlock[] {
+  const o = obj as Record<string, unknown>
+  if (fmt === 'openai') {
+    const msg = (o.choices as {message?: {reasoning_content?: string; content?: string}}[])?.[0]?.message
+    return blocksFrom(msg?.reasoning_content ?? '', msg?.content ?? rawText)
+  }
+  if (fmt === 'anthropic') {
+    const blocks: OutputBlock[] = []
+    for (const block of (o.content as {type: string; thinking?: string; text?: string}[]) ?? []) {
+      if (block.type === 'thinking') blocks.push({ type: 'thinking', content: block.thinking ?? '' })
+      else if (block.type === 'text') blocks.push({ type: 'text', content: block.text ?? '' })
+    }
+    return blocks.length > 0 ? blocks : [{ type: 'text', content: rawText }]
+  }
+  if (fmt === 'openai-responses') {
+    const text = (o.output as {content?: {text?: string}[]}[])?.[0]?.content?.[0]?.text ?? rawText
+    return [{ type: 'text', content: text }]
+  }
+  return [{ type: 'text', content: rawText }]
 }
 
 export default function TestPage() {
@@ -110,16 +151,18 @@ export default function TestPage() {
   const [fmt, setFmt] = useState<ApiFormat>('openai')
   const [prompt, setPrompt] = useState('')
   const [stream, setStream] = useState(true)
+  const [thinking, setThinking] = useState<ThinkingLevel>('off')
   const [imageSize, setImageSize] = useState('1024x1024')
   const [imageSizeCustom, setImageSizeCustom] = useState('')
   const [state, setState] = useState<SendState>('idle')
-  const [output, setOutput] = useState('')
+  const [blocks, setBlocks] = useState<OutputBlock[]>([])
   const [imageUrls, setImageUrls] = useState<string[]>([])
   const [errMsg, setErrMsg] = useState('')
   const [usage, setUsage] = useState<{ prompt?: number; completion?: number; total?: number } | null>(null)
   const [elapsed, setElapsed] = useState<number | null>(null)
   const [statusCode, setStatusCode] = useState<number | null>(null)
   const [copied, setCopied] = useState(false)
+  const [thinkingOpen, setThinkingOpen] = useState(true)
   const abortRef = useRef<AbortController | null>(null)
   const outputRef = useRef<HTMLDivElement>(null)
   const t0Ref = useRef<number>(0)
@@ -154,12 +197,13 @@ export default function TestPage() {
 
   const send = async () => {
     if (!prompt.trim() || !comboName) return
-    setOutput('')
+    setBlocks([])
     setImageUrls([])
     setErrMsg('')
     setUsage(null)
     setElapsed(null)
     setStatusCode(null)
+    setThinkingOpen(true)
     setState('sending')
     t0Ref.current = performance.now()
 
@@ -167,7 +211,7 @@ export default function TestPage() {
     abortRef.current = ctrl
 
     try {
-      const body = buildBody(fmt, comboName, prompt.trim(), stream, imageSizeCustom.trim() || imageSize)
+      const body = buildBody(fmt, comboName, prompt.trim(), stream, imageSizeCustom.trim() || imageSize, thinking)
       const resp = await fetch(FMT_ENDPOINT[fmt], {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer test' },
@@ -185,14 +229,17 @@ export default function TestPage() {
         setState('streaming')
         const reader = resp.body!.getReader()
         const decoder = new TextDecoder()
+        let accThinking = ''
         let accText = ''
         let lastUsage: ReturnType<typeof parseUsage> = null
         while (true) {
           const { done, value } = await reader.read()
           if (done) break
           const chunk = decoder.decode(value, { stream: true })
-          const { text, usage: u } = extractStreamText(chunk, fmt)
-          if (text) { accText += text; setOutput(accText) }
+          const { text, thinking: thk, usage: u } = extractStreamText(chunk, fmt)
+          if (thk) { accThinking += thk }
+          if (text) { accText += text }
+          setBlocks(blocksFrom(accThinking, accText))
           if (u) lastUsage = u
         }
         if (lastUsage) setUsage(lastUsage)
@@ -200,7 +247,6 @@ export default function TestPage() {
         const text = await resp.text()
         const parsed = parseUsage(text, fmt)
         if (parsed) setUsage(parsed)
-        // Extract content from JSON for display
         try {
           const obj = JSON.parse(text)
           if (fmt === 'openai-images') {
@@ -208,17 +254,10 @@ export default function TestPage() {
               d.url ?? (d.b64_json ? `data:image/png;base64,${d.b64_json}` : null)
             ).filter(Boolean)
             setImageUrls(urls)
-            setOutput(urls.length ? '' : text)
-          } else if (fmt === 'openai') {
-            setOutput(obj.choices?.[0]?.message?.content ?? text)
-          } else if (fmt === 'anthropic') {
-            setOutput(obj.content?.[0]?.text ?? text)
-          } else if (fmt === 'openai-responses') {
-            setOutput(obj.output?.[0]?.content?.[0]?.text ?? text)
           } else {
-            setOutput(text)
+            setBlocks(parseNonStreamBlocks(fmt, obj, text))
           }
-        } catch { setOutput(text) }
+        } catch { setBlocks([{ type: 'text', content: text }]) }
       }
 
       setElapsed(Math.round(performance.now() - t0Ref.current))
@@ -235,8 +274,10 @@ export default function TestPage() {
     }
   }
 
+  const outputText = blocks.filter(b => b.type === 'text').map(b => b.content).join('\n')
+
   const copy = () => {
-    navigator.clipboard.writeText(output).then(() => {
+    navigator.clipboard.writeText(outputText).then(() => {
       setCopied(true)
       setTimeout(() => setCopied(false), 1500)
     })
@@ -302,6 +343,35 @@ export default function TestPage() {
                     )}
                   </label>
                 </div>
+
+                {(fmt === 'openai' || fmt === 'anthropic') && (
+                  <div>
+                    <div className="field-label" style={{ marginBottom: 5 }}>
+                      思考等级
+                      <span className="dim" style={{ marginLeft: 6 }}>
+                        {fmt === 'openai' ? 'reasoning_effort' : 'thinking.budget_tokens'}
+                      </span>
+                    </div>
+                    <div style={{ display: 'flex', gap: 6 }}>
+                      {(['off', 'low', 'medium', 'high'] as ThinkingLevel[]).map(level => (
+                        <button
+                          key={level}
+                          className={thinking === level ? 'btn-primary' : ''}
+                          style={{ fontSize: 12, padding: '4px 10px', flex: 1 }}
+                          onClick={() => setThinking(level)}
+                          disabled={state === 'streaming' || state === 'sending'}
+                        >
+                          {level === 'off' ? '关闭' : level}
+                          {fmt === 'anthropic' && level !== 'off' && (
+                            <span style={{ display: 'block', fontSize: 10, opacity: 0.6 }}>
+                              {(ANTHROPIC_BUDGET[level] / 1000).toFixed(0)}k
+                            </span>
+                          )}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                )}
 
                 {fmt === 'openai-images' && (
                   <div style={{ marginTop: 12 }}>
@@ -477,7 +547,7 @@ export default function TestPage() {
                   流式传输中
                 </span>
               )}
-              {(output || imageUrls.length > 0) && state !== 'streaming' && state !== 'sending' && (
+              {(blocks.length > 0 || imageUrls.length > 0) && state !== 'streaming' && state !== 'sending' && (
                 <button className="btn-ghost" onClick={copy} style={{ fontSize: 12, display: 'flex', alignItems: 'center', gap: 4 }}>
                   <CopyIcon />{copied ? '已复制' : '复制'}
                 </button>
@@ -498,12 +568,12 @@ export default function TestPage() {
                 wordBreak: 'break-word',
               }}
             >
-              {state === 'idle' && !output && imageUrls.length === 0 && (
+              {state === 'idle' && blocks.length === 0 && imageUrls.length === 0 && (
                 <div className="empty-state" style={{ padding: '60px 20px' }}>
                   选择 Combo、输入提示词后发送请求
                 </div>
               )}
-              {state === 'sending' && !output && imageUrls.length === 0 && (
+              {state === 'sending' && blocks.length === 0 && imageUrls.length === 0 && (
                 <div className="empty-state" style={{ padding: '60px 20px' }}>
                   连接中…
                 </div>
@@ -515,27 +585,50 @@ export default function TestPage() {
                 <div style={{ display: 'flex', flexWrap: 'wrap', gap: 12 }}>
                   {imageUrls.map((url, i) => (
                     <a key={i} href={url} target="_blank" rel="noopener noreferrer">
-                      <img
-                        src={url}
-                        alt={`生成图像 ${i + 1}`}
+                      <img src={url} alt={`生成图像 ${i + 1}`}
                         style={{ maxWidth: '100%', maxHeight: 480, borderRadius: 6, border: '1px solid var(--border)', display: 'block' }}
                       />
                     </a>
                   ))}
                 </div>
               )}
-              {output}
-              {state === 'streaming' && (
-                <span style={{
-                  display: 'inline-block',
-                  width: 2,
-                  height: '1em',
-                  background: 'var(--text)',
-                  marginLeft: 2,
-                  verticalAlign: 'text-bottom',
-                  animation: 'blink 1s step-end infinite',
-                }} />
-              )}
+              {blocks.map((b, i) => b.type === 'thinking' ? (
+                <div key={i} style={{ marginBottom: 12 }}>
+                  <button
+                    onClick={() => setThinkingOpen(v => !v)}
+                    style={{
+                      display: 'flex', alignItems: 'center', gap: 6,
+                      fontSize: 11, fontWeight: 600, textTransform: 'uppercase', letterSpacing: '0.06em',
+                      color: 'var(--text-3)', background: 'none', border: 'none',
+                      cursor: 'pointer', padding: '4px 0', marginBottom: 4,
+                    }}
+                  >
+                    <span style={{ fontSize: 10, transition: 'transform 0.15s', display: 'inline-block', transform: thinkingOpen ? 'rotate(90deg)' : 'rotate(0deg)' }}>▶</span>
+                    思考过程
+                    {state === 'streaming' && <span style={{ opacity: 0.5, fontWeight: 400 }}>…</span>}
+                  </button>
+                  {thinkingOpen && (
+                    <div style={{
+                      fontFamily: 'var(--font-mono)', fontSize: 12, lineHeight: 1.65,
+                      color: 'var(--text-2)', whiteSpace: 'pre-wrap', wordBreak: 'break-word',
+                      background: 'var(--bg)', border: '1px solid var(--border)',
+                      borderRadius: 6, padding: '10px 12px',
+                    }}>
+                      {b.content}
+                      {state === 'streaming' && i === blocks.length - 1 && (
+                        <span style={{ display: 'inline-block', width: 2, height: '1em', background: 'var(--text-3)', marginLeft: 2, verticalAlign: 'text-bottom', animation: 'blink 1s step-end infinite' }} />
+                      )}
+                    </div>
+                  )}
+                </div>
+              ) : (
+                <div key={i} style={{ whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>
+                  {b.content}
+                  {state === 'streaming' && i === blocks.length - 1 && (
+                    <span style={{ display: 'inline-block', width: 2, height: '1em', background: 'var(--text)', marginLeft: 2, verticalAlign: 'text-bottom', animation: 'blink 1s step-end infinite' }} />
+                  )}
+                </div>
+              ))}
             </div>
           </div>
         </div>

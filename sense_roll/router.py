@@ -42,6 +42,22 @@ async def images_generations(request: Request) -> Response:
     return await _get_proxy(request).handle_openai_images_request(request)
 
 
+@router.get("/v1/models")
+async def list_models(request: Request) -> JSONResponse:
+    """Return available models (combos + aliases) in OpenAI-compatible format."""
+    svc = _get_proxy(request)
+    models = []
+    for c in svc.config.combos:
+        for model_id in [c.name, *c.aliases]:
+            models.append({
+                "id": model_id,
+                "object": "model",
+                "created": 0,
+                "owned_by": "sense-roll",
+            })
+    return JSONResponse(content={"object": "list", "data": models})
+
+
 @router.get("/health")
 async def health_check() -> JSONResponse:
     """Simple health-check endpoint."""

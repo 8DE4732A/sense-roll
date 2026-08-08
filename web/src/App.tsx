@@ -4,6 +4,7 @@ import Overview from './pages/Overview'
 import Requests from './pages/Requests'
 import ConfigEditor from './pages/ConfigEditor'
 import TestPage from './pages/Test'
+import InfoPage from './pages/Info'
 
 function IconChart() {
   return (
@@ -43,6 +44,16 @@ function IconFlask() {
   )
 }
 
+function IconInfo() {
+  return (
+    <svg className="nav-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5">
+      <circle cx="8" cy="8" r="6.5"/>
+      <line x1="8" y1="7" x2="8" y2="11"/>
+      <circle cx="8" cy="5" r="0.5" fill="currentColor" stroke="none"/>
+    </svg>
+  )
+}
+
 export default function App() {
   return (
     <div className="layout">
@@ -66,6 +77,9 @@ export default function App() {
           <NavLink to="/test" className={({ isActive }) => isActive ? 'nav-link active' : 'nav-link'}>
             <IconFlask />测试
           </NavLink>
+          <NavLink to="/info" className={({ isActive }) => isActive ? 'nav-link active' : 'nav-link'}>
+            <IconInfo />信息
+          </NavLink>
         </div>
         <div className="sidebar-footer">v0.1</div>
       </nav>
@@ -75,6 +89,7 @@ export default function App() {
           <Route path="/requests" element={<Requests />} />
           <Route path="/config" element={<ConfigEditor />} />
           <Route path="/test" element={<TestPage />} />
+          <Route path="/info" element={<InfoPage />} />
         </Routes>
       </main>
     </div>

@@ -17,6 +17,7 @@ GET  /admin/api/health              Process / DB health
 from __future__ import annotations
 
 import asyncio
+import importlib.metadata
 import sys
 from typing import Any
 
@@ -26,6 +27,11 @@ from fastapi.responses import JSONResponse
 from .config import ConfigError, build_config, dump_config
 
 admin_router = APIRouter(prefix="/admin/api")
+
+try:
+    _VERSION = importlib.metadata.version("sense-roll")
+except importlib.metadata.PackageNotFoundError:
+    _VERSION = "dev"
 
 
 # ---------------------------------------------------------------------------
@@ -151,6 +157,40 @@ async def list_requests(
 # ---------------------------------------------------------------------------
 # Health
 # ---------------------------------------------------------------------------
+
+@admin_router.get("/info")
+async def admin_info(request: Request) -> JSONResponse:
+    """Return app version and available model/combo information."""
+    svc = _gateway(request).service
+    combos = []
+    for c in svc.config.combos:
+        combos.append({
+            "name": c.name,
+            "aliases": c.aliases,
+            "api_formats": c.api_formats,
+            "strategy": c.strategy,
+            "members": [
+                {"provider": m.provider, "model": m.model}
+                for m in c.members
+            ],
+        })
+
+    providers = []
+    for p in svc.config.providers:
+        providers.append({
+            "name": p.name,
+            "api_formats": [ep.api_format for ep in p.api_endpoints],
+            "key_count": len(p.keys),
+            "strategy": p.key_strategy,
+        })
+
+    return JSONResponse(content={
+        "version": _VERSION,
+        "python": sys.version.split()[0],
+        "combos": combos,
+        "providers": providers,
+    })
+
 
 @admin_router.get("/health")
 async def admin_health(request: Request) -> JSONResponse:

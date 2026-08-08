@@ -136,6 +136,7 @@ api_format:
 | `POST /v1/messages` | anthropic | Anthropic Messages |
 | `POST /v1/responses` | openai-responses | OpenAI Responses API |
 | `POST /v1/images/generations` | openai-images | OpenAI Images |
+| `GET /v1/models` | — | 返回所有可用 combo（含 alias），OpenAI 兼容格式 |
 | `GET /health` | — | 健康检查 |
 | `GET /keys/status` | — | 实时密钥池状态 |
 | `GET /admin/` | — | 管理页面（需前端已打包） |

@@ -15,14 +15,24 @@ class ComboRouter:
 
     def __init__(self, combos: list[ComboConfig]) -> None:
         self._combos: dict[str, ComboConfig] = {c.name: c for c in combos}
+        # alias → canonical combo name mapping
+        self._aliases: dict[str, str] = {
+            alias: c.name
+            for c in combos
+            for alias in c.aliases
+        }
         self._rr_indices: dict[str, int] = {c.name: 0 for c in combos}
         self._lock = threading.Lock()
 
+    def _resolve(self, name: str) -> str:
+        """Resolve alias to canonical combo name."""
+        return self._aliases.get(name, name)
+
     def is_combo(self, name: str) -> bool:
-        return name in self._combos
+        return self._resolve(name) in self._combos
 
     def get_combo(self, name: str) -> ComboConfig | None:
-        return self._combos.get(name)
+        return self._combos.get(self._resolve(name))
 
     def next_member(
         self,
@@ -33,7 +43,8 @@ class ComboRouter:
 
         Returns None when all members have been attempted.
         """
-        combo = self._combos.get(combo_name)
+        canonical = self._resolve(combo_name)
+        combo = self._combos.get(canonical)
         if combo is None:
             return None
 
@@ -50,15 +61,17 @@ class ComboRouter:
                 return None
             else:
                 # Round-robin: advance from current index, scan all once
-                idx = self._rr_indices[combo_name]
+                idx = self._rr_indices[canonical]
                 for _ in range(len(members)):
                     idx = (idx + 1) % len(members)
                     m = members[idx]
                     pair = (m.provider, m.model)
                     if pair not in attempted:
-                        self._rr_indices[combo_name] = idx
+                        self._rr_indices[canonical] = idx
                         return pair
                 return None
 
     def list_combos(self) -> list[str]:
+        # Returns only canonical names, not aliases — aliases are transparent
+        # routing shortcuts for clients, not separately advertised model IDs.
         return list(self._combos.keys())
