@@ -359,3 +359,108 @@ class DumpConfigTests(unittest.TestCase):
         self.assertEqual(cfg2.combos[0].api_formats, ["openai", "anthropic"])
         self.assertTrue(cfg2.providers[0].supports_format("openai"))
         self.assertTrue(cfg2.providers[0].supports_format("anthropic"))
+
+
+class VerboseLoggingConfigTests(unittest.TestCase):
+    """Tests for verbose_logging field in AppConfig."""
+
+    def _minimal_raw(self) -> dict:
+        return {
+            "providers": [{
+                "name": "sn",
+                "api": [{"api_format": "openai", "base_url": "https://x/v1"}],
+                "keys": [{"key": "sk-1"}],
+            }],
+            "combos": [{"name": "fast", "api_format": "openai", "strategy": "fill-first",
+                        "members": [{"provider": "sn", "model": "m"}]}],
+        }
+
+    def test_default_is_false(self) -> None:
+        cfg = build_config(self._minimal_raw())
+        self.assertFalse(cfg.verbose_logging)
+
+    def test_explicit_true(self) -> None:
+        raw = self._minimal_raw()
+        raw["verbose_logging"] = True
+        cfg = build_config(raw)
+        self.assertTrue(cfg.verbose_logging)
+
+    def test_dump_includes_verbose_logging(self) -> None:
+        raw = self._minimal_raw()
+        raw["verbose_logging"] = True
+        cfg = build_config(raw)
+        d = dump_config(cfg)
+        self.assertIn("verbose_logging", d)
+        self.assertTrue(d["verbose_logging"])
+
+    def test_roundtrip_preserves_verbose_logging(self) -> None:
+        import yaml as _yaml
+        raw = self._minimal_raw()
+        raw["verbose_logging"] = True
+        cfg = build_config(raw)
+        dumped = _yaml.safe_dump(dump_config(cfg))
+        cfg2 = build_config(_yaml.safe_load(dumped))
+        self.assertTrue(cfg2.verbose_logging)
+
+
+class PayloadScriptConfigTests(unittest.TestCase):
+    """Tests for payload_scripts list in AppConfig."""
+
+    _MINIMAL = {
+        "providers": [{"name": "sn", "api": [{"api_format": "openai", "base_url": "https://x/v1"}], "keys": [{"key": "sk-1"}]}],
+        "combos": [{"name": "fast", "api_format": "openai", "strategy": "fill-first", "members": [{"provider": "sn", "model": "m"}]}],
+    }
+
+    def test_default_is_empty_list(self) -> None:
+        from sense_roll.config import build_config
+        cfg = build_config(dict(self._MINIMAL))
+        self.assertEqual(cfg.payload_scripts, [])
+
+    def test_parses_script_list(self) -> None:
+        from sense_roll.config import build_config
+        raw = {**self._MINIMAL, "payload_scripts": [
+            {"name": "hide-ua", "enabled": True, "script": "request.headers.pop('user-agent', None)"},
+            {"name": "limit-thinking", "enabled": False, "script": "request.body['x'] = 1"},
+        ]}
+        cfg = build_config(raw)
+        self.assertEqual(len(cfg.payload_scripts), 2)
+        self.assertEqual(cfg.payload_scripts[0].name, "hide-ua")
+        self.assertTrue(cfg.payload_scripts[0].enabled)
+        self.assertIn("user-agent", cfg.payload_scripts[0].script)
+        self.assertEqual(cfg.payload_scripts[1].name, "limit-thinking")
+        self.assertFalse(cfg.payload_scripts[1].enabled)
+
+    def test_rejects_non_list(self) -> None:
+        from sense_roll.config import build_config, ConfigError
+        raw = {**self._MINIMAL, "payload_scripts": "not a list"}
+        with self.assertRaises(ConfigError):
+            build_config(raw)
+
+    def test_rejects_non_dict_entry(self) -> None:
+        from sense_roll.config import build_config, ConfigError
+        raw = {**self._MINIMAL, "payload_scripts": ["not a dict"]}
+        with self.assertRaises(ConfigError):
+            build_config(raw)
+
+    def test_roundtrip_preserves_scripts(self) -> None:
+        import yaml as _yaml
+        from sense_roll.config import build_config, dump_config
+        raw = {**self._MINIMAL, "payload_scripts": [
+            {"name": "s1", "enabled": True, "script": "request.body['k'] = 1"},
+            {"name": "s2", "enabled": False, "script": "pass"},
+        ]}
+        cfg = build_config(raw)
+        dumped = _yaml.safe_dump(dump_config(cfg))
+        cfg2 = build_config(_yaml.safe_load(dumped))
+        self.assertEqual(len(cfg2.payload_scripts), 2)
+        self.assertEqual(cfg2.payload_scripts[0].name, "s1")
+        self.assertTrue(cfg2.payload_scripts[0].enabled)
+        self.assertFalse(cfg2.payload_scripts[1].enabled)
+
+    def test_dump_includes_payload_scripts(self) -> None:
+        from sense_roll.config import build_config, dump_config
+        raw = {**self._MINIMAL, "payload_scripts": [{"name": "test", "enabled": True, "script": "pass"}]}
+        cfg = build_config(raw)
+        d = dump_config(cfg)
+        self.assertIn("payload_scripts", d)
+        self.assertEqual(d["payload_scripts"][0]["name"], "test")

@@ -12,11 +12,15 @@ GET  /admin/api/stats/summary       Aggregated DB stats
 GET  /admin/api/stats/trend         Time-bucketed request counts / tokens
 GET  /admin/api/requests            Paginated request log
 GET  /admin/api/health              Process / DB health
+GET  /admin/api/logs                Paginated verbose JSONL log (newest first)
+GET  /admin/api/logs/settings       Verbose logging toggle state
+PUT  /admin/api/logs/settings       Toggle verbose_logging, persist to config.yaml
 """
 
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import importlib.metadata
 import sys
 from typing import Any
@@ -51,6 +55,14 @@ def _recorder(request: Request):
     if rec is None:
         raise HTTPException(status_code=503, detail="recorder not initialised")
     return rec
+
+
+def _report_logger(request: Request):
+    gw = _gateway(request)
+    rl = getattr(gw, "_report_logger", None)
+    if rl is None:
+        raise HTTPException(status_code=503, detail="report logger not initialised")
+    return rl
 
 
 # ---------------------------------------------------------------------------
@@ -191,6 +203,56 @@ async def admin_info(request: Request) -> JSONResponse:
         "providers": providers,
     })
 
+
+# ---------------------------------------------------------------------------
+# Verbose logs
+# ---------------------------------------------------------------------------
+
+@admin_router.get("/logs")
+async def list_logs(
+    request: Request,
+    limit: int = 20,
+    offset: int = 0,
+    success: bool | None = None,
+) -> JSONResponse:
+    """Return a page of detailed JSONL log records (newest first).
+
+    WARNING: Records contain full HTTP headers, including plaintext API keys.
+    This endpoint is strictly for local use.
+    """
+    rl = _report_logger(request)
+    result = await asyncio.to_thread(rl.read, limit, offset, success)
+    return JSONResponse(content=result)
+
+
+@admin_router.get("/logs/settings")
+async def get_log_settings(request: Request) -> JSONResponse:
+    """Return the current verbose_logging flag."""
+    svc = _gateway(request).service
+    return JSONResponse(content={"verbose_logging": svc.config.verbose_logging})
+
+
+@admin_router.put("/logs/settings")
+async def put_log_settings(request: Request) -> JSONResponse:
+    """Toggle verbose_logging, persist to config.yaml, and hot-reload."""
+    body: Any = await request.json()
+    if not isinstance(body, dict) or "enabled" not in body:
+        raise HTTPException(status_code=400, detail='request body must be {"enabled": bool}')
+    enabled = bool(body["enabled"])
+
+    gw = _gateway(request)
+    new_config = dataclasses.replace(gw.service.config, verbose_logging=enabled)
+    try:
+        await asyncio.to_thread(gw.save_and_reload, new_config)
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": f"reload failed: {e}"})
+
+    return JSONResponse(content={"verbose_logging": enabled})
+
+
+# ---------------------------------------------------------------------------
+# Health
+# ---------------------------------------------------------------------------
 
 @admin_router.get("/health")
 async def admin_health(request: Request) -> JSONResponse:

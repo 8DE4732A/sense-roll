@@ -34,11 +34,13 @@ class GatewayState:
         self,
         config: AppConfig,
         config_path: str | Path,
-        recorder=None,  # db.Recorder | None — optional to avoid circular import at type-check
+        recorder=None,       # db.Recorder | None — optional to avoid circular import at type-check
+        report_logger=None,  # report_log.ReportLogger | None
     ) -> None:
         self._lock = threading.Lock()           # guards _service replacement only
         self._config_path = Path(config_path)
         self._recorder = recorder
+        self._report_logger = report_logger
         # The httpx client is shared across reloads so existing keep-alive
         # connections are not dropped on every config save.
         self._client = httpx.AsyncClient(timeout=httpx.Timeout(120.0))
@@ -67,6 +69,7 @@ class GatewayState:
             ComboRouter(config.combos),
             client=self._client,
             recorder=self._recorder,
+            report_logger=self._report_logger,
         )
 
     # ------------------------------------------------------------------

@@ -55,7 +55,8 @@ class ProxyService:
         provider_key_managers: dict[str, ProviderKeyManager],
         combo_router: ComboRouter,
         client: httpx.AsyncClient | None = None,
-        recorder=None,  # db.Recorder | None — avoids circular import
+        recorder=None,   # db.Recorder | None — avoids circular import
+        report_logger=None,  # report_log.ReportLogger | None
     ) -> None:
         self.config = config
         self.provider_key_managers = provider_key_managers
@@ -65,8 +66,12 @@ class ProxyService:
         self._owns_client = client is None
         self.client = client if client is not None else httpx.AsyncClient(timeout=httpx.Timeout(120.0))
         self._recorder = recorder
+        self._report_logger = report_logger
+        self._verbose: bool = config.verbose_logging
 
         self._providers: dict[str, ProviderConfig] = {p.name: p for p in config.providers}
+
+        self._payload_scripts = config.payload_scripts  # list[PayloadScript]
 
         # Pre-compile jsonpath expressions per provider
         self._provider_rules: dict[str, list[tuple]] = {}
@@ -116,6 +121,16 @@ class ProxyService:
         is_stream = False if force_non_stream else self._is_streaming_request(request, body)
         requested_model = self._extract_model(body)
 
+        # Capture client-side request context for verbose logging (zero overhead when off)
+        _client_report_ctx: dict | None = None
+        if self._verbose and self._report_logger is not None:
+            _client_report_ctx = {
+                "method": request.method,
+                "path": str(request.url.path),
+                "headers": dict(request.headers),
+                "body": _try_parse_json(body),
+            }
+
         combo = self.combo_router.get_combo(requested_model)
         if combo is None:
             return JSONResponse(
@@ -151,7 +166,9 @@ class ProxyService:
             km = self.provider_key_managers[provider_name]
             provider_cfg = self._providers[provider_name]
             target_url = provider_cfg.get_chat_url(api_format)
-            actual_body = self._rewrite_model(body, model)
+            # Body after model-name rewrite (pre-payload-rules); used as the
+            # baseline each key attempt so payload rules start from the same input.
+            _model_rewritten_body = self._rewrite_model(body, model)
             attempted_keys: set[str] = set()
             max_attempts = provider_cfg.max_retries + 1
 
@@ -163,11 +180,41 @@ class ProxyService:
                 attempted_keys.add(key)
                 headers = self._build_headers(request, key)
 
+                # Run enabled payload scripts in order (chained: output of one is input of next).
+                actual_body: bytes = _model_rewritten_body
+                matched_payload_parts: list[str] = []
+                for ps in self._payload_scripts:
+                    if not ps.enabled:
+                        continue
+                    actual_body, headers, status = _run_payload_script(
+                        ps.script,
+                        requested_model,
+                        str(request.url.path),
+                        actual_body,
+                        headers,
+                    )
+                    if status is not None:
+                        label = ps.name or f"script@{id(ps)}"
+                        matched_payload_parts.append(f"{label}:{status}")
+                matched_payload = ", ".join(matched_payload_parts) or None
+
+                # Capture upstream request context for verbose logging.
+                _upstream_report_ctx: dict | None = None
+                if _client_report_ctx is not None:
+                    _upstream_report_ctx = {
+                        "url": target_url,
+                        "headers": dict(headers),
+                        "body": _try_parse_json(actual_body),
+                    }
+
                 try:
                     if is_stream:
                         result, matched_rule = await self._proxy_streaming(
                             target_url, headers, actual_body, provider_name, model,
                             combo=requested_model, key=key, t0=t0, api_format=api_format,
+                            client_ctx=_client_report_ctx,
+                            upstream_ctx=_upstream_report_ctx,
+                            matched_payload=matched_payload,
                         )
                     else:
                         result, matched_rule = await self._proxy_non_streaming(
@@ -187,6 +234,7 @@ class ProxyService:
                             status_code=None, success=False,
                             matched_rule=matched_rule.description,
                             usage={}, t0=t0,
+                            matched_payload=matched_payload,
                         )
                         continue
 
@@ -212,7 +260,24 @@ class ProxyService:
                             status_code=result.status_code, success=http_ok,
                             matched_rule=None, usage=usage, t0=t0,
                             error=err_text,
+                            matched_payload=matched_payload,
                         )
+                        # Verbose report (non-streaming)
+                        if _client_report_ctx is not None and _upstream_report_ctx is not None:
+                            resp_headers = dict(result.headers) if hasattr(result, "headers") else {}
+                            self._report(
+                                combo=requested_model, provider=provider_name, model=model,
+                                api_format=api_format, is_stream=False,
+                                status_code=result.status_code, success=http_ok,
+                                duration_ms=int((perf_counter() - t0) * 1000),
+                                client_ctx=_client_report_ctx,
+                                upstream_ctx=_upstream_report_ctx,
+                                response_ctx={
+                                    "status_code": result.status_code,
+                                    "headers": resp_headers,
+                                    "body": _try_parse_json(raw_body),
+                                },
+                            )
                     else:
                         km.record_success(key, model)
                     return result  # type: ignore[return-value]
@@ -224,6 +289,7 @@ class ProxyService:
                         key_prefix=key[:8], api_format=api_format, is_stream=is_stream,
                         status_code=504, success=False, matched_rule=None,
                         usage={}, t0=t0, error="upstream timeout",
+                        matched_payload=matched_payload,
                     )
                     return JSONResponse(
                         status_code=504,
@@ -236,6 +302,7 @@ class ProxyService:
                         key_prefix=key[:8], api_format=api_format, is_stream=is_stream,
                         status_code=502, success=False, matched_rule=None,
                         usage={}, t0=t0, error="upstream connection failed",
+                        matched_payload=matched_payload,
                     )
                     return JSONResponse(
                         status_code=502,
@@ -267,6 +334,7 @@ class ProxyService:
         usage: dict,
         t0: float,
         error: str | None = None,
+        matched_payload: str | None = None,
     ) -> None:
         if self._recorder is None:
             return
@@ -288,6 +356,42 @@ class ProxyService:
             "cache_write_tokens": usage.get("cache_write_tokens"),
             "duration_ms": int((perf_counter() - t0) * 1000),
             "error": error,
+            "matched_payload": matched_payload,
+        })
+
+    def _report(
+        self,
+        *,
+        combo: str,
+        provider: str,
+        model: str,
+        api_format: str,
+        is_stream: bool,
+        status_code: int | None,
+        success: bool,
+        duration_ms: int,
+        client_ctx: dict,
+        upstream_ctx: dict,
+        response_ctx: dict,
+    ) -> None:
+        """Log a full verbose report record.  No-op when verbose logging is off."""
+        if not self._verbose or self._report_logger is None:
+            return
+        self._report_logger.log({
+            "ts": time.time(),
+            "combo": combo,
+            "provider": provider,
+            "model": model,
+            "api_format": api_format,
+            "is_stream": is_stream,
+            "status_code": status_code,
+            "success": success,
+            "duration_ms": duration_ms,
+            "request": {
+                "client": client_ctx,
+                "upstream": upstream_ctx,
+            },
+            "response": response_ctx,
         })
 
     # ------------------------------------------------------------------
@@ -412,6 +516,9 @@ class ProxyService:
         key: str = "",
         t0: float = 0.0,
         api_format: str = "",
+        client_ctx: dict | None = None,
+        upstream_ctx: dict | None = None,
+        matched_payload: str | None = None,
     ) -> tuple[Response | None, HealthCheckRule | None]:
         req = self.client.build_request("POST", target_url, headers=headers, content=body)
         upstream_resp = await self.client.send(req, stream=True)
@@ -442,6 +549,7 @@ class ProxyService:
                     api_format=api_format, is_stream=True,
                     status_code=status_code, success=False,
                     matched_rule=None, usage={}, t0=t0, error=err_text,
+                    matched_payload=matched_payload,
                 )
             return (
                 Response(
@@ -472,24 +580,34 @@ class ProxyService:
             await upstream_resp.aclose()
             return None, matched_rule
 
-        # Capture references for the closure
+        # Capture references for the closure (value snapshots protect against
+        # hot-reload replacing self attributes mid-stream).
         recorder = self._recorder
-        record_fn = self._record
+        verbose = self._verbose
+        report_logger = self._report_logger
+        # Narrow verbose-ctx pair for the closure (both are set together or not at all).
+        _verbose_ctx = (client_ctx, upstream_ctx) if (client_ctx is not None and upstream_ctx is not None) else None
         # Usage sniffing state: pending holds cross-chunk partial SSE lines
         usage_holder: dict = {"pending": bytearray(), "usage": {}}
 
         async def _forward() -> AsyncGenerator[bytes, None]:
+            # Accumulate response bytes for verbose logging (only when enabled)
+            resp_accumulator: bytearray | None = bytearray() if (verbose and report_logger is not None) else None
             try:
                 if first_chunk:
                     _sniff_usage_chunk(first_chunk, api_format, usage_holder)
+                    if resp_accumulator is not None:
+                        resp_accumulator.extend(first_chunk)
                     yield first_chunk
                 async for chunk in upstream_iter:
                     _sniff_usage_chunk(chunk, api_format, usage_holder)
+                    if resp_accumulator is not None:
+                        resp_accumulator.extend(chunk)
                     yield chunk
             finally:
                 await upstream_resp.aclose()
                 if recorder is not None:
-                    record_fn(
+                    self._record(
                         combo=combo, provider=provider_name, model=model,
                         key_prefix=key[:8] if key else "",
                         api_format=api_format, is_stream=True,
@@ -497,6 +615,23 @@ class ProxyService:
                         matched_rule=None,
                         usage=usage_holder["usage"],
                         t0=t0,
+                        matched_payload=matched_payload,
+                    )
+                # Verbose report (streaming)
+                if resp_accumulator is not None and _verbose_ctx is not None:
+                    _v_client, _v_upstream = _verbose_ctx
+                    self._report(
+                        combo=combo, provider=provider_name, model=model,
+                        api_format=api_format, is_stream=True,
+                        status_code=status_code, success=status_code < 400,
+                        duration_ms=int((perf_counter() - t0) * 1000),
+                        client_ctx=_v_client,
+                        upstream_ctx=_v_upstream,
+                        response_ctx={
+                            "status_code": status_code,
+                            "headers": dict(resp_headers),
+                            "body": _try_parse_json(bytes(resp_accumulator)),
+                        },
                     )
 
         return (
@@ -536,6 +671,15 @@ class ProxyService:
 # ---------------------------------------------------------------------------
 # Module-level token-extraction utilities
 # ---------------------------------------------------------------------------
+
+def _try_parse_json(data: bytes | str) -> object:
+    """Try to parse *data* as JSON; return the string on failure."""
+    raw = data if isinstance(data, str) else data.decode("utf-8", errors="replace")
+    try:
+        return json.loads(raw)
+    except (json.JSONDecodeError, ValueError):
+        return raw
+
 
 def _extract_usage(body: bytes, api_format: str) -> dict:
     """Parse the ``usage`` field from a completed (non-streaming) response body.
@@ -632,3 +776,92 @@ def _sniff_usage_chunk(chunk: bytes, api_format: str, holder: dict) -> None:
                 cached = details.get("cached_tokens")
                 if cached is not None:
                     holder["usage"]["cache_read_tokens"] = cached
+
+
+# ---------------------------------------------------------------------------
+# Payload script execution
+# ---------------------------------------------------------------------------
+
+class _Req:
+    """Mutable request context passed to the user's payload script.
+
+    Attributes the script may read and modify:
+        combo   – the client-facing combo/model name (str, read-only by convention)
+        path    – request path, e.g. "/v1/chat/completions" (str, read-only)
+        method  – HTTP method, always "POST" (str, read-only)
+        body    – parsed JSON body (dict); modify fields in-place or replace entirely
+        headers – request headers dict; modify in-place
+        raw_body – original body bytes, set only when body is not valid JSON
+    """
+
+    __slots__ = ("combo", "path", "method", "body", "headers", "raw_body")
+
+    def __init__(
+        self,
+        combo: str,
+        path: str,
+        body: dict,
+        headers: dict[str, str],
+        raw_body: bytes = b"",
+    ) -> None:
+        self.combo = combo
+        self.path = path
+        self.method = "POST"
+        self.body = body
+        self.headers = headers
+        self.raw_body = raw_body
+
+
+def _run_payload_script(
+    script: str,
+    combo_name: str,
+    path: str,
+    body: bytes,
+    headers: dict[str, str],
+) -> tuple[bytes, dict[str, str], str | None]:
+    """Execute *script* against a ``request`` context and return the rewritten body,
+    headers, and an execution status string (``None`` = not executed / no-op).
+
+    The script runs with ``exec`` in a fresh namespace containing only
+    ``request`` (a ``_Req`` instance) and the standard builtins.
+
+    On any exception the original body and headers are returned unchanged;
+    a warning is logged and the exception summary is returned as the status.
+    Empty script is a no-op (returns originals immediately).
+    """
+    if not script or not script.strip():
+        return body, headers, None
+
+    # Parse body; set raw_body when not valid JSON so the script can still inspect it.
+    try:
+        body_dict: dict = json.loads(body)
+        raw_body = b""
+    except (json.JSONDecodeError, ValueError):
+        body_dict = {}
+        raw_body = body
+
+    req = _Req(
+        combo=combo_name,
+        path=path,
+        body=body_dict,
+        headers=dict(headers),  # copy so the script works on a fresh dict
+        raw_body=raw_body,
+    )
+
+    try:
+        exec(script, {"request": req, "__builtins__": __builtins__})  # noqa: S102
+    except Exception as exc:
+        logger.warning("payload script raised %s: %s", type(exc).__name__, exc)
+        return body, headers, f"error: {type(exc).__name__}: {exc}"
+
+    # Re-encode body only when it was valid JSON (script may have mutated body_dict).
+    if raw_body:
+        new_body = body  # not JSON; return as-is
+    else:
+        try:
+            new_body = json.dumps(req.body, ensure_ascii=False).encode()
+        except Exception as exc:
+            logger.warning("payload script: failed to re-encode body: %s", exc)
+            new_body = body
+
+    return new_body, req.headers, "ok"

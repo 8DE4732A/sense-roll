@@ -54,18 +54,24 @@ async def lifespan(app: FastAPI):
         )
 
     from .db import Recorder, db_path_for_config  # noqa: PLC0415
+    from .report_log import ReportLogger, report_log_dir  # noqa: PLC0415
 
     db_path = db_path_for_config(config_path)
     recorder = Recorder(db_path)
     logger.info("SQLite recorder initialised at %s", db_path)
 
-    gateway = GatewayState(config, config_path, recorder=recorder)
+    log_dir = report_log_dir()
+    report_logger = ReportLogger(log_dir)
+    logger.info("Report logger initialised at %s (verbose_logging=%s)", log_dir, config.verbose_logging)
+
+    gateway = GatewayState(config, config_path, recorder=recorder, report_logger=report_logger)
     app.state.gateway = gateway
 
     yield
 
     await gateway.aclose()
     recorder.close()
+    await report_logger.aclose()
     logger.info("sense-roll shut down")
 
 

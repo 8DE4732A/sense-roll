@@ -90,11 +90,12 @@ export default function Requests() {
               <th>Cache W</th>
               <th>耗时</th>
               <th>轮换规则</th>
+              <th>Payload 改写</th>
             </tr>
           </thead>
           <tbody>
             {rows.length === 0 && (
-              <tr><td colSpan={11} style={{ textAlign: 'center', color: 'var(--text-3)', padding: 32 }}>暂无数据</td></tr>
+              <tr><td colSpan={13} style={{ textAlign: 'center', color: 'var(--text-3)', padding: 32 }}>暂无数据</td></tr>
             )}
             {rows.map(r => (
               <tr key={r.id} className={r.success ? '' : 'row-err'}>
@@ -126,6 +127,9 @@ export default function Requests() {
                 <td className="text-muted">{r.duration_ms != null ? r.duration_ms + ' ms' : '—'}</td>
                 <td style={{ fontSize: 12, maxWidth: 180, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', color: 'var(--text-2)' }}>
                   {r.matched_rule ?? r.error ?? '—'}
+                </td>
+                <td style={{ fontSize: 12, maxWidth: 180, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', color: r.matched_payload ? 'var(--accent)' : 'var(--text-3)' }}>
+                  {r.matched_payload ?? '—'}
                 </td>
               </tr>
             ))}

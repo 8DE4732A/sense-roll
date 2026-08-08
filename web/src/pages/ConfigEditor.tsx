@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react'
 import { getConfig, putConfig, FMT_ENDPOINT, FMT_COLOR, normalizeFormats } from '../api/client'
 import type {
   AppConfig, ProviderConfig, ComboConfig, HealthCheckRule, ComboMember, ApiEndpoint, ApiFormat,
+  PayloadScript,
 } from '../api/client'
 
 const ALL_FORMATS: ApiFormat[] = ['openai', 'anthropic', 'openai-responses', 'openai-images']
@@ -19,6 +20,7 @@ const EMPTY_COMBO = (): ComboConfig => ({
   name: '', api_format: ['openai'], strategy: 'fill-first',
   members: [{ provider: '', model: '' }], aliases: [],
 })
+const EMPTY_PAYLOAD_SCRIPT = (): PayloadScript => ({ name: '', enabled: true, script: '' })
 
 
 // ── Icons ────────────────────────────────────────────────────────
@@ -399,21 +401,24 @@ function ComboDetail({
   )
 }
 
+// ── Payload rule detail panel ────────────────────────────────────
 // ── Main ─────────────────────────────────────────────────────────
 export default function ConfigEditor() {
   const [cfg, setCfg] = useState<AppConfig | null>(null)
   const [saving, setSaving] = useState(false)
   const [msg, setMsg] = useState('')
   const [err, setErr] = useState('')
-  const [tab, setTab] = useState<'providers' | 'combos'>('providers')
+  const [tab, setTab] = useState<'providers' | 'combos' | 'payload'>('providers')
   const [selProvider, setSelProvider] = useState(0)
   const [selCombo, setSelCombo] = useState(0)
+  const [selPayload, setSelPayload] = useState(0)
 
   useEffect(() => {
     getConfig()
       .then(raw => setCfg({
         ...raw,
         combos: raw.combos.map(c => ({ aliases: [], ...c, api_format: normalizeFormats(c.api_format) })),
+        payload_scripts: raw.payload_scripts ?? [],
       }))
       .catch(e => setErr(String(e)))
   }, [])
@@ -463,9 +468,34 @@ export default function ConfigEditor() {
     setSelCombo(p => Math.max(0, p > i ? p - 1 : p === i ? Math.max(0, p - 1) : p))
   }
 
+  const payloadScripts = (cfg?.payload_scripts ?? [])
+  const updatePayloadScript = (i: number, patch: Partial<PayloadScript>) =>
+    setCfg(c => c ? { ...c, payload_scripts: (c.payload_scripts ?? []).map((s, j) => j === i ? { ...s, ...patch } : s) } : c)
+  const addPayloadScript = () => {
+    const newIdx = payloadScripts.length
+    setCfg(c => c ? { ...c, payload_scripts: [...(c.payload_scripts ?? []), EMPTY_PAYLOAD_SCRIPT()] } : c)
+    setSelPayload(newIdx)
+  }
+  const removePayloadScript = (i: number) => {
+    setCfg(c => c ? { ...c, payload_scripts: (c.payload_scripts ?? []).filter((_, j) => j !== i) } : c)
+    setSelPayload(p => Math.max(0, p > i ? p - 1 : p === i ? Math.max(0, p - 1) : p))
+  }
+  const movePayloadScript = (i: number, dir: -1 | 1) => {
+    const j = i + dir
+    setCfg(c => {
+      if (!c) return c
+      const scripts = [...(c.payload_scripts ?? [])]
+      if (j < 0 || j >= scripts.length) return c
+      ;[scripts[i], scripts[j]] = [scripts[j], scripts[i]]
+      return { ...c, payload_scripts: scripts }
+    })
+    setSelPayload(j)
+  }
+
   const providerNames = cfg.providers.map(p => p.name).filter(Boolean)
   const curProvider = cfg.providers[selProvider]
   const curCombo = cfg.combos[selCombo]
+  const curPayloadScript = payloadScripts[selPayload]
 
   return (
     <div className="page" style={{ paddingBottom: 80, display: 'flex', flexDirection: 'column', height: '100%' }}>
@@ -484,8 +514,8 @@ export default function ConfigEditor() {
 
       {/* Tab bar */}
       <div style={{ display: 'flex', gap: 2, marginBottom: 16, background: 'var(--bg)', padding: 4, borderRadius: 8, border: '1px solid var(--border)', width: 'fit-content' }}>
-        {(['providers', 'combos'] as const).map(t => {
-          const count = t === 'providers' ? cfg.providers.length : cfg.combos.length
+        {(['providers', 'combos', 'payload'] as const).map(t => {
+          const count = t === 'providers' ? cfg.providers.length : t === 'combos' ? cfg.combos.length : payloadScripts.length
           const active = tab === t
           return (
             <button key={t} onClick={() => setTab(t)} style={{
@@ -501,7 +531,7 @@ export default function ConfigEditor() {
               transition: 'all 0.12s',
               display: 'flex', alignItems: 'center', gap: 6,
             }}>
-              {t === 'providers' ? 'Providers' : 'Combos'}
+              {t === 'providers' ? 'Providers' : t === 'combos' ? 'Combos' : 'Payload 脚本'}
               <span style={{
                 fontSize: 11, padding: '1px 6px', borderRadius: 10,
                 background: active ? 'var(--accent-light)' : 'var(--bg-code)',
@@ -520,15 +550,15 @@ export default function ConfigEditor() {
         <div style={{ width: 220, minWidth: 220, borderRight: '1px solid var(--border)', display: 'flex', flexDirection: 'column', background: 'var(--bg)' }}>
           <div style={{ padding: '10px 12px 8px', borderBottom: '1px solid var(--border)', display: 'flex', alignItems: 'center', gap: 6 }}>
             <span style={{ fontSize: 11, fontWeight: 600, textTransform: 'uppercase', letterSpacing: '0.07em', color: 'var(--text-3)', flex: 1 }}>
-              {tab === 'providers' ? 'Providers' : 'Combos'}
+              {tab === 'providers' ? 'Providers' : tab === 'combos' ? 'Combos' : 'Payload 脚本'}
             </span>
             <button className="btn-ghost" style={{ padding: '2px 6px', fontSize: 11 }}
-              onClick={tab === 'providers' ? addProvider : addCombo}>
+              onClick={tab === 'providers' ? addProvider : tab === 'combos' ? addCombo : addPayloadScript}>
               <IconPlus /> 添加
             </button>
           </div>
           <div style={{ flex: 1, overflowY: 'auto' }}>
-            {(tab === 'providers' ? cfg.providers : cfg.combos).map((item, idx) => {
+            {tab !== 'payload' && (tab === 'providers' ? cfg.providers : cfg.combos).map((item, idx) => {
               const isProvider = tab === 'providers'
               const selected = isProvider ? selProvider === idx : selCombo === idx
               const p = item as ProviderConfig
@@ -578,6 +608,34 @@ export default function ConfigEditor() {
                         +{(cb.aliases ?? []).length}别名
                       </span>
                     )}
+                  </div>
+                </div>
+              )
+            })}
+            {tab === 'payload' && payloadScripts.map((ps, idx) => {
+              const selected = selPayload === idx
+              return (
+                <div key={idx}
+                  onClick={() => setSelPayload(idx)}
+                  style={{
+                    padding: '9px 12px',
+                    cursor: 'pointer',
+                    borderBottom: '1px solid var(--border)',
+                    background: selected ? 'var(--bg-panel)' : 'transparent',
+                    borderLeft: selected ? '2px solid var(--accent)' : '2px solid transparent',
+                    transition: 'background 0.1s',
+                    opacity: ps.enabled ? 1 : 0.55,
+                  }}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                    <span style={{
+                      fontSize: 13, fontWeight: selected ? 500 : 400,
+                      color: ps.name ? 'var(--text)' : 'var(--text-3)',
+                      flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+                    }}>{ps.name || '未命名脚本'}</span>
+                    {!ps.enabled && (
+                      <span className="tag" style={{ fontSize: 10, padding: '1px 5px', color: 'var(--text-3)' }}>已禁用</span>
+                    )}
+                    {selected && <IconChevronRight />}
                   </div>
                 </div>
               )
@@ -640,6 +698,97 @@ export default function ConfigEditor() {
               <div className="empty-state" style={{ paddingTop: 80 }}>
                 <div style={{ marginBottom: 12 }}>还没有 Combo</div>
                 <button className="btn-primary" onClick={addCombo}><IconPlus /> 添加第一个 Combo</button>
+              </div>
+            )
+          )}
+
+          {tab === 'payload' && (
+            curPayloadScript ? (
+              <div>
+                {/* Header: name + enabled toggle + sort + delete */}
+                <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 20, paddingBottom: 16, borderBottom: '1px solid var(--border)' }}>
+                  <input
+                    value={curPayloadScript.name}
+                    onChange={e => updatePayloadScript(selPayload, { name: e.target.value })}
+                    placeholder="脚本名称"
+                    style={{ flex: 1, fontSize: 15, fontWeight: 500 }}
+                  />
+                  {/* Enabled toggle */}
+                  <label style={{
+                    display: 'flex', alignItems: 'center', gap: 6, cursor: 'pointer',
+                    padding: '5px 10px', borderRadius: 5,
+                    border: `1px solid ${curPayloadScript.enabled ? 'var(--accent)' : 'var(--border-md)'}`,
+                    background: curPayloadScript.enabled ? 'var(--accent-light)' : 'var(--bg-input)',
+                    fontSize: 12, fontWeight: 500, userSelect: 'none',
+                  }}>
+                    <input type="checkbox" checked={curPayloadScript.enabled}
+                      onChange={e => updatePayloadScript(selPayload, { enabled: e.target.checked })}
+                    />
+                    {curPayloadScript.enabled ? '已启用' : '已禁用'}
+                  </label>
+                  {/* Sort buttons */}
+                  <button className="btn-icon" title="上移" disabled={selPayload === 0}
+                    onClick={() => movePayloadScript(selPayload, -1)}
+                    style={{ padding: '4px 8px' }}>
+                    ↑
+                  </button>
+                  <button className="btn-icon" title="下移" disabled={selPayload >= payloadScripts.length - 1}
+                    onClick={() => movePayloadScript(selPayload, 1)}
+                    style={{ padding: '4px 8px' }}>
+                    ↓
+                  </button>
+                  {/* Delete */}
+                  <button className="btn-icon" onClick={() => removePayloadScript(selPayload)}
+                    style={{ width: 'auto', padding: '4px 10px', fontSize: 12, display: 'flex', alignItems: 'center', gap: 4, color: 'var(--err-fg)', border: '1px solid var(--border)' }}>
+                    <IconTrash /> 删除
+                  </button>
+                </div>
+
+                {/* request object reference */}
+                <div style={{
+                  display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 6,
+                  background: 'var(--bg)', border: '1px solid var(--border)', borderRadius: 6,
+                  padding: '8px 12px', marginBottom: 12, fontSize: 12, color: 'var(--text-2)',
+                }}>
+                  <div><code style={{ fontFamily: 'var(--font-mono)', color: 'var(--accent)' }}>request.body</code><br /><span style={{ color: 'var(--text-3)' }}>请求 body dict，可直接改</span></div>
+                  <div><code style={{ fontFamily: 'var(--font-mono)', color: 'var(--accent)' }}>request.headers</code><br /><span style={{ color: 'var(--text-3)' }}>请求 headers dict，可直接改</span></div>
+                  <div><code style={{ fontFamily: 'var(--font-mono)', color: 'var(--accent)' }}>request.combo</code><br /><span style={{ color: 'var(--text-3)' }}>客户端传的 combo 名（只读）</span></div>
+                </div>
+
+                {/* Script editor */}
+                <textarea
+                  value={curPayloadScript.script}
+                  onChange={e => updatePayloadScript(selPayload, { script: e.target.value })}
+                  spellCheck={false}
+                  rows={20}
+                  placeholder={"# 示例\nrequest.headers.pop('user-agent', None)\n\nif request.combo == 'fast' and 'thinking' in request.body:\n    request.body['thinking']['budget_tokens'] = 1024"}
+                  style={{
+                    width: '100%',
+                    fontFamily: 'var(--font-mono)',
+                    fontSize: 13,
+                    lineHeight: 1.6,
+                    padding: '12px 14px',
+                    background: 'var(--bg)',
+                    border: '1px solid var(--border-md)',
+                    borderRadius: 6,
+                    color: 'var(--text)',
+                    resize: 'vertical',
+                    boxSizing: 'border-box',
+                    outline: 'none',
+                    tabSize: 4,
+                  }}
+                />
+                <div style={{ marginTop: 8, fontSize: 12, color: 'var(--text-3)' }}>
+                  脚本异常时请求原样转发，异常摘要记录在请求明细 <code style={{ fontFamily: 'var(--font-mono)', fontSize: 11 }}>matched_payload</code> 字段。
+                </div>
+              </div>
+            ) : (
+              <div className="empty-state" style={{ paddingTop: 80 }}>
+                <div style={{ marginBottom: 12 }}>还没有 Payload 脚本</div>
+                <div style={{ fontSize: 12, color: 'var(--text-3)', marginBottom: 16, maxWidth: 360 }}>
+                  脚本按顺序执行，通过 <code style={{ fontFamily: 'var(--font-mono)' }}>request</code> 对象改写请求的 body 和 headers，可用于隐藏客户端标识、调整 thinking 参数等。
+                </div>
+                <button className="btn-primary" onClick={addPayloadScript}><IconPlus /> 添加第一个脚本</button>
               </div>
             )
           )}

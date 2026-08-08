@@ -5,6 +5,7 @@ import Requests from './pages/Requests'
 import ConfigEditor from './pages/ConfigEditor'
 import TestPage from './pages/Test'
 import InfoPage from './pages/Info'
+import LogsPage from './pages/Logs'
 
 function IconChart() {
   return (
@@ -54,6 +55,17 @@ function IconInfo() {
   )
 }
 
+function IconLog() {
+  return (
+    <svg className="nav-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5">
+      <rect x="2" y="1.5" width="12" height="13" rx="1.5"/>
+      <line x1="5" y1="5" x2="11" y2="5"/>
+      <line x1="5" y1="8" x2="11" y2="8"/>
+      <line x1="5" y1="11" x2="8.5" y2="11"/>
+    </svg>
+  )
+}
+
 export default function App() {
   return (
     <div className="layout">
@@ -69,6 +81,9 @@ export default function App() {
           </NavLink>
           <NavLink to="/requests" className={({ isActive }) => isActive ? 'nav-link active' : 'nav-link'}>
             <IconList />请求明细
+          </NavLink>
+          <NavLink to="/logs" className={({ isActive }) => isActive ? 'nav-link active' : 'nav-link'}>
+            <IconLog />日志
           </NavLink>
           <div className="nav-label" style={{ marginTop: 16 }}>管理</div>
           <NavLink to="/config" className={({ isActive }) => isActive ? 'nav-link active' : 'nav-link'}>
@@ -90,6 +105,7 @@ export default function App() {
           <Route path="/config" element={<ConfigEditor />} />
           <Route path="/test" element={<TestPage />} />
           <Route path="/info" element={<InfoPage />} />
+          <Route path="/logs" element={<LogsPage />} />
         </Routes>
       </main>
     </div>

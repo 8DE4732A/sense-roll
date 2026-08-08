@@ -66,6 +66,24 @@ sense-roll -c config.yaml --port 8000
 | **请求明细** | 分页日志，含 combo / provider / model / key / 状态码 / token 用量 |
 | **配置** | 主从布局编辑 Provider 和 Combo，保存后热重载无需重启 |
 | **测试** | 直接调用代理端点验证配置，支持流式展示和图像生成 |
+| **日志** | 详细请求报文记录，可展开查看完整 client/upstream 请求与响应 |
+| **配置 > Payload 脚本** | 在转发前执行 Python 脚本改写请求内容（body / header），用于隐藏客户端标识、调整 thinking 参数等 |
+
+### 详细日志（Verbose Logging）
+
+> ⚠️ **安全警告**：详细日志会完整记录 HTTP header，其中包含上游 Provider 的**明文 API 密钥**。日志文件仅限本地使用，已自动加入 `.gitignore`，请勿将 `logs/` 目录暴露至公网或提交至版本控制。
+
+在管理页面「日志」菜单可通过开关启用/停用，开关状态持久化写入 `config.yaml`，重启后保留。
+
+- **日志位置**：`<启动目录>/logs/requests.jsonl`（即 `cwd/logs/`，与 `config.yaml` 无关）。
+- **滚动策略**：单文件超过 **20MB** 自动 gzip 压缩归档为 `requests.jsonl.1.gz`，旧归档依次后移，最多保留 **10 个** `.gz`，总磁盘占用通常不超过 ~200MB（视报文体积而定）。
+- **记录内容**：每次对 Provider 的一次尝试写一条 JSONL，包含：
+  - 元数据（ts / combo / provider / model / status_code / duration_ms …）
+  - `request.client`：客户端发来的原始 HTTP 方法、路径、header、body
+  - `request.upstream`：转发给 Provider 的 URL、header（含明文 API key）、body
+  - `response`：Provider 返回的状态码、header、body
+
+也可通过 API 直接查询：`GET /admin/api/logs`、`GET/PUT /admin/api/logs/settings`。
 
 ## 配置说明
 
@@ -79,7 +97,44 @@ providers:
 
 combos:
   - ...   # 虚拟模型名到 Provider 的映射
+
+verbose_logging: false  # 可选，true 时在 cwd/logs/ 记录完整请求报文（含明文密钥）
+
+payload_scripts:       # 可选，按顺序执行的 Python 脚本列表
+  - name: "..."        # 名称
+    enabled: true      # false = 跳过（保留配置）
+    script: |
+      # request.body / request.headers 可直接修改
 ```
+
+### Payload 改写脚本列表
+
+在转发请求给上游 Provider 之前，按顺序执行已启用的脚本。每个脚本的输出是下一个脚本的输入。在管理页面「配置 > Payload 脚本」Tab 中管理，每条脚本可单独命名、启用/禁用、排序，保存后立即生效。
+
+**`request` 对象可用属性：**
+
+| 属性 | 类型 | 说明 |
+|---|---|---|
+| `request.body` | `dict` | 请求 body（可直接改；非 JSON body 时为 `{}`）|
+| `request.headers` | `dict` | 请求 headers（可直接改）|
+| `request.combo` | `str` | 客户端传的 combo 名（只读参考）|
+| `request.path` | `str` | 请求路径，如 `/v1/chat/completions`（只读）|
+| `request.raw_body` | `bytes` | 原始 body，仅非 JSON 时有值 |
+
+**示例：**
+
+```python
+# 脚本 1：隐藏客户端标识
+request.headers.pop('user-agent', None)
+
+# 脚本 2：对 fast combo 限制 thinking 预算
+if request.combo == 'fast' and 'thinking' in request.body:
+    request.body['thinking']['budget_tokens'] = 1024
+```
+
+各脚本的执行情况（名称 + `ok` 或错误摘要）记录在请求明细的 `matched_payload` 字段。
+
+⚠️ 脚本以 `exec()` 执行，具有完整 Python 权限，仅限本地/私有网络使用。
 
 ### `providers`
 

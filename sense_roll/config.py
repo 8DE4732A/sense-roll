@@ -41,6 +41,20 @@ class HealthCheckRule:
 
 
 @dataclass
+class PayloadScript:
+    """A named Python script applied to the request before forwarding.
+
+    Scripts are executed in list order; only enabled scripts run.
+    Each script receives a ``request`` object and may mutate ``request.body``
+    and ``request.headers`` in-place.
+    """
+
+    name: str = ""
+    enabled: bool = True
+    script: str = ""
+
+
+@dataclass
 class ApiEndpoint:
     """One (api_format, base_url) pair inside a provider's api list."""
 
@@ -120,6 +134,8 @@ class AppConfig:
 
     providers: list[ProviderConfig] = field(default_factory=list)
     combos: list[ComboConfig] = field(default_factory=list)
+    verbose_logging: bool = False
+    payload_scripts: list[PayloadScript] = field(default_factory=list)
 
 
 def _coerce_to_list(raw: object, context: str) -> list:
@@ -359,7 +375,28 @@ def build_config(raw: dict) -> AppConfig:
             aliases=aliases,
         ))
 
-    return AppConfig(providers=providers, combos=combos)
+    verbose_logging = bool(raw.get("verbose_logging", False))
+
+    # --- payload_scripts ---
+    scripts_raw = raw.get("payload_scripts", [])
+    if not isinstance(scripts_raw, list):
+        raise ConfigError("'payload_scripts' must be a list")
+    payload_scripts: list[PayloadScript] = []
+    for i, s in enumerate(scripts_raw):
+        if not isinstance(s, dict):
+            raise ConfigError(f"payload_scripts[{i}] must be a mapping")
+        payload_scripts.append(PayloadScript(
+            name=str(s.get("name", "")).strip(),
+            enabled=bool(s.get("enabled", True)),
+            script=str(s.get("script", "")),
+        ))
+
+    return AppConfig(
+        providers=providers,
+        combos=combos,
+        verbose_logging=verbose_logging,
+        payload_scripts=payload_scripts,
+    )
 
 
 def load_config(path: str | Path = "config.yaml") -> AppConfig:
@@ -416,5 +453,14 @@ def dump_config(cfg: AppConfig) -> dict:
                 **({"aliases": c.aliases} if c.aliases else {}),
             }
             for c in cfg.combos
+        ],
+        "verbose_logging": cfg.verbose_logging,
+        "payload_scripts": [
+            {
+                "name": s.name,
+                "enabled": s.enabled,
+                "script": s.script,
+            }
+            for s in cfg.payload_scripts
         ],
     }

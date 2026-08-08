@@ -45,7 +45,8 @@ CREATE TABLE IF NOT EXISTS requests (
   cache_read_tokens  INTEGER,
   cache_write_tokens INTEGER,
   duration_ms      INTEGER,
-  error            TEXT
+  error            TEXT,
+  matched_payload  TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_requests_ts       ON requests(ts);
 CREATE INDEX IF NOT EXISTS idx_requests_combo    ON requests(combo);
@@ -55,6 +56,7 @@ CREATE INDEX IF NOT EXISTS idx_requests_prov_mdl ON requests(provider, model);
 _MIGRATIONS = [
     "ALTER TABLE requests ADD COLUMN cache_read_tokens  INTEGER",
     "ALTER TABLE requests ADD COLUMN cache_write_tokens INTEGER",
+    "ALTER TABLE requests ADD COLUMN matched_payload    TEXT",
 ]
 
 _INSERT = """
@@ -63,13 +65,13 @@ INSERT INTO requests
    status_code, success, matched_rule,
    prompt_tokens, completion_tokens, total_tokens,
    cache_read_tokens, cache_write_tokens,
-   duration_ms, error)
+   duration_ms, error, matched_payload)
 VALUES
   (:ts, :combo, :provider, :model, :key_prefix, :api_format, :is_stream,
    :status_code, :success, :matched_rule,
    :prompt_tokens, :completion_tokens, :total_tokens,
    :cache_read_tokens, :cache_write_tokens,
-   :duration_ms, :error)
+   :duration_ms, :error, :matched_payload)
 """
 
 
@@ -267,7 +269,7 @@ def _fill_defaults(row: dict) -> dict:
         "success": 0, "matched_rule": None,
         "prompt_tokens": None, "completion_tokens": None, "total_tokens": None,
         "cache_read_tokens": None, "cache_write_tokens": None,
-        "duration_ms": None, "error": None,
+        "duration_ms": None, "error": None, "matched_payload": None,
     }
     defaults.update(row)
     return defaults

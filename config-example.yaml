@@ -100,3 +100,30 @@ combos:
     members:
       - provider: sensenova
         model: "deepseek-v4-0324"
+
+# ---------------------------------------------------------------------------
+# Payload 改写脚本列表（可选，默认为空）
+# 按顺序执行，前一个脚本的修改结果传给下一个；disabled 脚本自动跳过
+# ---------------------------------------------------------------------------
+payload_scripts:
+  # -----------------------------------------------------------------------
+  # 脚本 1：删除可能暴露客户端信息的 headers
+  # -----------------------------------------------------------------------
+  - name: "隐藏客户端标识"
+    enabled: true
+    script: |
+      request.headers.pop('user-agent', None)
+      request.headers.pop('User-Agent', None)
+      request.headers.pop('x-client-version', None)
+      request.body.pop('x_client_info', None)
+
+  # -----------------------------------------------------------------------
+  # 脚本 2：对 fast combo 限制 thinking 预算（当前已禁用，方便复用时开启）
+  # -----------------------------------------------------------------------
+  - name: "fast combo 限制 thinking 预算"
+    enabled: false
+    script: |
+      if request.combo == 'fast' and 'thinking' in request.body:
+          request.body['thinking']['budget_tokens'] = min(
+              request.body['thinking'].get('budget_tokens', 8000), 1024
+          )

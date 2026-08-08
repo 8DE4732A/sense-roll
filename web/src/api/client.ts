@@ -72,9 +72,16 @@ export type ComboConfig = {
   aliases?: string[]
 }
 
+export type PayloadScript = {
+  name: string
+  enabled: boolean
+  script: string
+}
+
 export type AppConfig = {
   providers: ProviderConfig[]
   combos: ComboConfig[]
+  payload_scripts?: PayloadScript[]
 }
 
 export const getConfig = () => request<AppConfig>('/config')
@@ -151,6 +158,7 @@ export type RequestRow = {
   status_code: number | null
   success: number
   matched_rule: string | null
+  matched_payload: string | null
   prompt_tokens: number | null
   completion_tokens: number | null
   total_tokens: number | null
@@ -208,3 +216,30 @@ export type AdminHealth = {
   db: { queue_size: number; dropped_count: number; db_path: string }
 }
 export const getAdminHealth = () => request<AdminHealth>('/health')
+
+// ---- Verbose Logs ----
+type LogHttpPart = { method?: string; path?: string; url?: string; headers: Record<string, string>; body: unknown }
+export type LogRecord = {
+  ts: number
+  combo: string | null
+  provider: string | null
+  model: string | null
+  api_format: string | null
+  is_stream: boolean
+  status_code: number | null
+  success: boolean
+  duration_ms: number | null
+  request: { client: LogHttpPart; upstream: LogHttpPart }
+  response: { status_code: number | null; headers: Record<string, string>; body: unknown }
+}
+export type LogsResp = { items: LogRecord[]; has_more: boolean }
+export type LogSettings = { verbose_logging: boolean }
+
+export const getLogs = (params: { limit?: number; offset?: number; success?: boolean }) => {
+  const qs = new URLSearchParams()
+  Object.entries(params).forEach(([k, v]) => { if (v != null) qs.set(k, String(v)) })
+  return request<LogsResp>(`/logs?${qs}`)
+}
+export const getLogSettings = () => request<LogSettings>('/logs/settings')
+export const putLogSettings = (enabled: boolean) =>
+  request<LogSettings>('/logs/settings', { method: 'PUT', body: JSON.stringify({ enabled }) })

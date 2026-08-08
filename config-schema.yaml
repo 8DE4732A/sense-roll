@@ -17,6 +17,11 @@ providers:           # list，至少一个 ProviderConfig
 combos:              # list，至少一个 ComboConfig
   - <ComboConfig>
 
+verbose_logging:     [bool, default=false]  # 是否写详细请求报文到 cwd/logs/（含明文密钥，慎用）
+
+payload_scripts:     [list[PayloadScript], default=[]]
+                     # 转发前按顺序执行的 Python 脚本列表；disabled 脚本自动跳过
+
 
 # ===========================================================================
 # ProviderConfig
@@ -143,3 +148,28 @@ ComboMember:
 # GET  /admin/api/config           查看/编辑配置
 # GET  /admin/api/stats/summary    聚合统计
 # GET  /admin/api/requests         请求明细
+# GET  /admin/api/logs             详细请求报文（需开启 verbose_logging）
+# GET  /admin/api/logs/settings    查看/切换 verbose_logging
+
+
+# ===========================================================================
+# PayloadScript — payload_script_list 元素
+# ===========================================================================
+# 一个有名称、可启用/禁用的 Python 脚本。
+# 脚本按列表顺序执行，每个脚本的输出（修改后的 body/headers）是下一个脚本的输入。
+# disabled 脚本保留在列表中但不执行，方便临时关闭。
+#
+# request 对象可用属性：
+#   request.body     — 解析后的请求 body（dict），直接修改即可；非 JSON body 时为 {}
+#   request.headers  — 请求 headers（dict），直接修改即可
+#   request.combo    — 客户端传的 combo/model 名（str，只读）
+#   request.path     — 请求路径（str，只读）
+#   request.method   — 始终为 POST（str，只读）
+#   request.raw_body — 原始 body 字节（bytes），仅当 body 非 JSON 时有值
+#
+# ⚠ 脚本以 exec() 执行，具有完整 Python 权限，仅限本地/私有网络使用。
+
+PayloadScript:
+  name:     [string, default=""]    # 可读名称，出现在请求明细 matched_payload 字段
+  enabled:  [bool, default=true]    # false = 跳过此脚本（保留配置，方便复用）
+  script:   [string, default=""]    # Python 脚本体；建议用 YAML | 块标量格式
