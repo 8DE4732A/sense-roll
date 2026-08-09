@@ -27,3 +27,5 @@ sense_roll/web/dist/
 
 .pytest_cache/
 .DS_Store
+
+.claude

@@ -551,6 +551,20 @@ class ProxyService:
                     matched_rule=None, usage={}, t0=t0, error=err_text,
                     matched_payload=matched_payload,
                 )
+                if client_ctx is not None and upstream_ctx is not None:
+                    self._report(
+                        combo=combo, provider=provider_name, model=model,
+                        api_format=api_format, is_stream=True,
+                        status_code=status_code, success=False,
+                        duration_ms=int((perf_counter() - t0) * 1000),
+                        client_ctx=client_ctx,
+                        upstream_ctx=upstream_ctx,
+                        response_ctx={
+                            "status_code": status_code,
+                            "headers": dict(resp_headers),
+                            "body": _try_parse_json(resp_body),
+                        },
+                    )
             return (
                 Response(
                     content=resp_body,
